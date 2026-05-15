@@ -1,9 +1,19 @@
-// face-detect.swift — macOS CLI for face detection + embeddings via Apple Vision Framework.
-// Build: swiftc -O -framework AVFoundation face-detect.swift -o face-detect
+// face-detect.swift — macOS CLI for face detection + recognition embeddings.
+// Build: swiftc -O -framework AVFoundation -framework CoreML face-detect.swift -o face-detect
 // Requires: macOS 14+, Apple Silicon recommended (Neural Engine).
+//
+// Embeddings: AdaFace IR-18 (Core ML, 512-dim L2-normalized) for face recognition.
+// Fallback: Vision VNGenerateImageFeaturePrintRequest (768-dim, generic image similarity).
+//
+// Model search paths (in order):
+//   1. $FACE_DETECT_MODEL_PATH
+//   2. <binary_dir>/AdaFace_IR18.mlpackage
+//   3. /opt/homebrew/share/face-detect/AdaFace_IR18.mlpackage
+//   4. /usr/local/share/face-detect/AdaFace_IR18.mlpackage
 
 import AppKit
 import AVFoundation
+import CoreML
 import Foundation
 import Vision
 
@@ -37,6 +47,8 @@ struct ImageResult: Encodable {
     let width: Int
     let height: Int
     let elapsed_ms: Int
+    let engine: String
+    let engine_dim: Int
     let description: String?
     let tags: [TagResult]?
     let faces: [FaceResult]?
@@ -66,6 +78,46 @@ struct BenchResult: Encodable {
     let avg_ms: Double
     let fps: Double
     let embedding_dim: Int
+}
+
+// MARK: - Watch protocol
+
+struct WatchRequest: Decodable {
+    let id: String?
+    let image: String?
+    let ping: Bool?
+}
+
+// Output for non-image control commands (ping). For image requests,
+// we emit the normal ImageResult, optionally with `request_id` propagated.
+struct PongResponse: Encodable {
+    let pong: Bool
+    let request_id: String?
+    let uptime_ms: Int
+    let processed: Int
+    let engine: String
+    let engine_dim: Int
+}
+
+// Wrapper to add request_id to ImageResult without changing the base struct.
+// We encode manually so the field order is deterministic and request_id
+// is omitted when absent (back-compat with single-path input format).
+struct IdentifiedImageResult: Encodable {
+    let request_id: String?
+    let result: ImageResult
+
+    enum CodingKeys: String, CodingKey {
+        case request_id
+    }
+
+    func encode(to encoder: Encoder) throws {
+        // Encode ImageResult fields at top level, plus request_id when present.
+        try result.encode(to: encoder)
+        if let id = request_id {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .request_id)
+        }
+    }
 }
 
 // MARK: - Image loading
@@ -117,9 +169,51 @@ func extractLandmarks(face: VNFaceObservation) -> [String: [[Double]]]? {
     return result.isEmpty ? nil : result
 }
 
-// MARK: - Embedding extraction
+// MARK: - Embedding engines
 
-func extractEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
+enum EmbeddingEngine: String {
+    case adaface
+    case vision
+}
+
+// Loaded once at startup, reused for all images.
+var adaFaceModel: VNCoreMLModel?
+var activeEngine: EmbeddingEngine = .adaface
+var minQuality: Float = 0.0
+
+func locateModel() -> URL? {
+    let candidates: [String] = [
+        ProcessInfo.processInfo.environment["FACE_DETECT_MODEL_PATH"] ?? "",
+        Bundle.main.bundlePath + "/AdaFace_IR18.mlpackage",
+        ((CommandLine.arguments.first as NSString?)?.deletingLastPathComponent ?? "") + "/AdaFace_IR18.mlpackage",
+        "/opt/homebrew/share/face-detect/AdaFace_IR18.mlpackage",
+        "/usr/local/share/face-detect/AdaFace_IR18.mlpackage",
+    ]
+    for path in candidates where !path.isEmpty {
+        if FileManager.default.fileExists(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+    }
+    return nil
+}
+
+func loadAdaFaceModel() {
+    guard let modelURL = locateModel() else {
+        FileHandle.standardError.write(Data("face-detect: AdaFace model not found, falling back to Vision FeaturePrint (768d)\n".utf8))
+        activeEngine = .vision
+        return
+    }
+    do {
+        let compiled = try MLModel.compileModel(at: modelURL)
+        let model = try MLModel(contentsOf: compiled)
+        adaFaceModel = try VNCoreMLModel(for: model)
+    } catch {
+        FileHandle.standardError.write(Data("face-detect: model load failed (\(error)), falling back to Vision\n".utf8))
+        activeEngine = .vision
+    }
+}
+
+func croppedFaceImage(cgImage: CGImage, bbox: CGRect) -> CGImage? {
     // Expand bbox by 20% for context (hair, chin)
     let pad = CGFloat(0.2)
     let expanded = CGRect(
@@ -130,23 +224,42 @@ func extractEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
     ).intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
 
     let pixelRect = VNImageRectForNormalizedRect(expanded, cgImage.width, cgImage.height)
-    guard pixelRect.width > 0, pixelRect.height > 0,
-          let cropped = cgImage.cropping(to: pixelRect) else {
+    guard pixelRect.width > 0, pixelRect.height > 0 else { return nil }
+    return cgImage.cropping(to: pixelRect)
+}
+
+// AdaFace: 512-dim L2-normalized embedding via Core ML (Neural Engine when possible)
+func extractAdaFaceEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
+    guard let model = adaFaceModel,
+          let cropped = croppedFaceImage(cgImage: cgImage, bbox: bbox) else {
         return []
     }
-
-    let req = VNGenerateImageFeaturePrintRequest()
+    let request = VNCoreMLRequest(model: model)
+    request.imageCropAndScaleOption = .scaleFill
     let handler = VNImageRequestHandler(cgImage: cropped)
     do {
-        try handler.perform([req])
+        try handler.perform([request])
     } catch {
         return []
     }
-
-    guard let obs = req.results?.first as? VNFeaturePrintObservation else {
+    guard let result = request.results?.first as? VNCoreMLFeatureValueObservation,
+          let array = result.featureValue.multiArrayValue else {
         return []
     }
+    var floats = [Float](repeating: 0, count: array.count)
+    for i in 0..<array.count {
+        floats[i] = Float(array[i].doubleValue)
+    }
+    return floats
+}
 
+// Vision FeaturePrint: 768-dim generic image similarity (fallback)
+func extractVisionEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
+    guard let cropped = croppedFaceImage(cgImage: cgImage, bbox: bbox) else { return [] }
+    let req = VNGenerateImageFeaturePrintRequest()
+    let handler = VNImageRequestHandler(cgImage: cropped)
+    do { try handler.perform([req]) } catch { return [] }
+    guard let obs = req.results?.first as? VNFeaturePrintObservation else { return [] }
     let count = obs.elementCount
     var floats = [Float](repeating: 0, count: count)
     obs.data.withUnsafeBytes { rawBuf in
@@ -154,6 +267,20 @@ func extractEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
         memcpy(&floats, ptr, count * MemoryLayout<Float>.size)
     }
     return floats
+}
+
+func extractEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
+    switch activeEngine {
+    case .adaface: return extractAdaFaceEmbedding(cgImage: cgImage, bbox: bbox)
+    case .vision:  return extractVisionEmbedding(cgImage: cgImage, bbox: bbox)
+    }
+}
+
+func engineDim() -> Int {
+    switch activeEngine {
+    case .adaface: return 512
+    case .vision:  return 768
+    }
 }
 
 // MARK: - Description generation
@@ -232,7 +359,9 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
         try handler.perform([landmarksReq, classifyReq])
     } catch {
         let ms = elapsedMs(since: start)
-        return ImageResult(image: path, width: w, height: h, elapsed_ms: ms, description: nil, tags: nil, faces: nil,
+        return ImageResult(image: path, width: w, height: h, elapsed_ms: ms,
+                           engine: activeEngine.rawValue, engine_dim: engineDim(),
+                           description: nil, tags: nil, faces: nil,
                            error: "vision failed: \(error.localizedDescription)")
     }
 
@@ -256,9 +385,12 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
         }
     }
 
-    // Phase 3: per-face embedding + assembly
+    // Phase 3: per-face embedding + assembly (skip faces below min-quality)
     var faces: [FaceResult] = []
     for (i, obs) in observations.enumerated() {
+        let q = i < qualities.count ? qualities[i] : nil
+        if let q = q, minQuality > 0, q < minQuality { continue }
+
         let bb = obs.boundingBox
         let embedding = extractEmbedding(cgImage: cgImage, bbox: bb)
         let lm = extractLandmarks(face: obs)
@@ -267,7 +399,7 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
             bbox: [Double(bb.origin.x), Double(bb.origin.y),
                    Double(bb.width), Double(bb.height)],
             confidence: obs.confidence,
-            quality: i < qualities.count ? qualities[i] : nil,
+            quality: q,
             roll: obs.roll?.doubleValue,
             yaw: obs.yaw?.doubleValue,
             pitch: obs.pitch?.doubleValue,
@@ -279,7 +411,9 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
 
     let ms = elapsedMs(since: start)
     let desc = generateDescription(faceCount: faces.count, tags: tags)
-    return ImageResult(image: path, width: w, height: h, elapsed_ms: ms, description: desc, tags: tags, faces: faces, error: nil)
+    return ImageResult(image: path, width: w, height: h, elapsed_ms: ms,
+                       engine: activeEngine.rawValue, engine_dim: engineDim(),
+                       description: desc, tags: tags, faces: faces, error: nil)
 }
 
 func elapsedMs(since start: DispatchTime) -> Int {
@@ -307,6 +441,7 @@ func cmdBatch() {
                 emit(processImage(path: path, cgImage: cg))
             } else {
                 emit(ImageResult(image: path, width: 0, height: 0, elapsed_ms: 0,
+                                 engine: activeEngine.rawValue, engine_dim: engineDim(),
                                  description: nil, tags: nil, faces: nil, error: "cannot load image"))
             }
         }
@@ -322,17 +457,32 @@ func cmdWatch(inPath: String, outPath: String) {
     let shutdownSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
     shutdownSrc.setEventHandler { exit(0) }
     shutdownSrc.resume()
-    signal(SIGTERM, SIG_IGN) // let DispatchSource handle it
+    signal(SIGTERM, SIG_IGN)
 
     let intSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     intSrc.setEventHandler { exit(0) }
     intSrc.resume()
     signal(SIGINT, SIG_IGN)
 
-    FileHandle.standardError.write(Data("face-detect: watch mode started\n".utf8))
+    let startTime = DispatchTime.now()
+    var processed = 0
+
+    func logStderr(_ msg: String) {
+        FileHandle.standardError.write(Data("face-detect: \(msg)\n".utf8))
+    }
+
+    func emitJSON<T: Encodable>(_ value: T, to handle: FileHandle) {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.sortedKeys]
+        guard let data = try? enc.encode(value) else { return }
+        handle.write(data)
+        handle.write(Data([0x0a]))
+    }
+
+    logStderr("ready (engine=\(activeEngine.rawValue), dim=\(engineDim()), in=\(inPath), out=\(outPath))")
 
     while true {
-        // Open blocks until a writer connects
+        // Opens block until writer/reader connect
         guard let inHandle = FileHandle(forReadingAtPath: inPath) else {
             die("cannot open input FIFO: \(inPath)")
         }
@@ -346,7 +496,13 @@ func cmdWatch(inPath: String, outPath: String) {
             if chunk.isEmpty { break } // EOF — writer disconnected
             buffer.append(chunk)
 
-            // Process complete lines
+            // Cap buffer growth at 64 KiB (paths > PATH_MAX are pathological)
+            if buffer.count > 65536 {
+                logStderr("input buffer overflow (>64KiB without newline), dropping")
+                buffer.removeAll(keepingCapacity: true)
+                continue
+            }
+
             while let nlRange = buffer.range(of: Data([0x0a])) {
                 let lineData = buffer[buffer.startIndex..<nlRange.lowerBound]
                 buffer.removeSubrange(buffer.startIndex...nlRange.lowerBound)
@@ -356,26 +512,70 @@ func cmdWatch(inPath: String, outPath: String) {
                       !line.isEmpty else { continue }
 
                 autoreleasepool {
-                    let result: ImageResult
-                    if let (cg, _, _) = loadCGImage(path: line) {
-                        result = processImage(path: line, cgImage: cg)
+                    // Parse: JSON command, or plain path (back-compat)
+                    var requestId: String? = nil
+                    var imagePath: String? = nil
+                    var isPing = false
+
+                    if line.hasPrefix("{") {
+                        if let data = line.data(using: .utf8),
+                           let req = try? JSONDecoder().decode(WatchRequest.self, from: data) {
+                            requestId = req.id
+                            imagePath = req.image
+                            isPing = req.ping ?? false
+                        } else {
+                            // JSON-looking but unparseable: treat as path
+                            imagePath = line
+                        }
                     } else {
-                        result = ImageResult(image: line, width: 0, height: 0, elapsed_ms: 0,
-                                             description: nil, tags: nil, faces: nil, error: "cannot load image")
+                        imagePath = line
                     }
-                    let enc = JSONEncoder()
-                    enc.outputFormatting = [.sortedKeys]
-                    if let json = try? enc.encode(result) {
-                        outHandle.write(json)
-                        outHandle.write(Data([0x0a]))
+
+                    // Handle ping
+                    if isPing {
+                        let uptime = Int((DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000)
+                        emitJSON(PongResponse(
+                            pong: true,
+                            request_id: requestId,
+                            uptime_ms: uptime,
+                            processed: processed,
+                            engine: activeEngine.rawValue,
+                            engine_dim: engineDim()
+                        ), to: outHandle)
+                        return
                     }
+
+                    guard let path = imagePath else {
+                        logStderr("malformed request: \(line.prefix(100))")
+                        return
+                    }
+
+                    let result: ImageResult
+                    let t0 = DispatchTime.now()
+                    if let (cg, _, _) = loadCGImage(path: path) {
+                        logStderr("processing \(path)")
+                        result = processImage(path: path, cgImage: cg)
+                    } else {
+                        result = ImageResult(
+                            image: path, width: 0, height: 0, elapsed_ms: 0,
+                            engine: activeEngine.rawValue, engine_dim: engineDim(),
+                            description: nil, tags: nil, faces: nil, error: "cannot load image"
+                        )
+                    }
+                    processed += 1
+                    let took = Int((DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000)
+                    let faceCount = result.faces?.count ?? 0
+                    let errPart = result.error.map { " error=\($0)" } ?? ""
+                    logStderr("done \(path) in \(took)ms (\(faceCount) faces)\(errPart)")
+
+                    emitJSON(IdentifiedImageResult(request_id: requestId, result: result), to: outHandle)
                 }
             }
         }
 
         inHandle.closeFile()
         outHandle.closeFile()
-        FileHandle.standardError.write(Data("face-detect: writer disconnected, waiting for reconnect\n".utf8))
+        logStderr("writer disconnected (processed=\(processed)), waiting for reconnect")
     }
 }
 
@@ -424,6 +624,7 @@ func cmdVideo(path: String, fps: Double) {
                 emit(result)
             } else {
                 emit(ImageResult(image: label, width: 0, height: 0, elapsed_ms: 0,
+                                 engine: activeEngine.rawValue, engine_dim: engineDim(),
                                  description: nil, tags: nil, faces: nil, error: frameError?.localizedDescription ?? "frame extraction failed"))
             }
         }
@@ -484,16 +685,50 @@ func cmdBench(dir: String) {
 
 // MARK: - Argument parsing & dispatch
 
-let args = Array(CommandLine.arguments.dropFirst())
+// Extract global flags (--engine, --min-quality) and return remaining args.
+func extractGlobalFlags(_ args: [String]) -> [String] {
+    var rest: [String] = []
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        if a == "--engine", i + 1 < args.count {
+            if let eng = EmbeddingEngine(rawValue: args[i + 1]) {
+                activeEngine = eng
+            } else {
+                die("invalid --engine: \(args[i + 1]) (use adaface or vision)")
+            }
+            i += 2
+        } else if a == "--min-quality", i + 1 < args.count {
+            minQuality = Float(args[i + 1]) ?? 0.0
+            i += 2
+        } else {
+            rest.append(a)
+            i += 1
+        }
+    }
+    return rest
+}
+
+let rawArgs = Array(CommandLine.arguments.dropFirst())
+let args = extractGlobalFlags(rawArgs)
 
 if args.isEmpty {
     die("""
-        usage: face-detect <image>
-               face-detect --batch
-               face-detect --watch --in <fifo> --out <fifo>
-               face-detect --video <file> [--fps <rate>]
-               face-detect --bench <folder>
+        usage: face-detect [GLOBAL_FLAGS] <image>
+               face-detect [GLOBAL_FLAGS] --batch
+               face-detect [GLOBAL_FLAGS] --watch --in <fifo> --out <fifo>
+               face-detect [GLOBAL_FLAGS] --video <file> [--fps <rate>]
+               face-detect [GLOBAL_FLAGS] --bench <folder>
+
+        GLOBAL_FLAGS:
+               --engine adaface|vision   (default: adaface)
+               --min-quality 0.0-1.0     (default: 0, no filtering)
         """)
+}
+
+// Load AdaFace model if needed (silent fallback to Vision on failure)
+if activeEngine == .adaface {
+    loadAdaFaceModel()
 }
 
 switch args[0] {
@@ -539,27 +774,35 @@ case "--bench":
 
 case "--help", "-h":
     print("""
-    face-detect — detect faces and generate embeddings via Apple Vision Framework.
+    face-detect — face detection + recognition embeddings via Apple Vision + AdaFace.
 
     USAGE
-      face-detect <image>                              Single image → JSON stdout
-      face-detect --batch                              stdin paths → NDJSON stdout
-      face-detect --watch --in <fifo> --out <fifo>     FIFO daemon (long-running)
-      face-detect --video <file> [--fps <rate>]        Video frames → NDJSON stdout
-      face-detect --bench <folder>                     Benchmark throughput
+      face-detect [FLAGS] <image>                              Single image → JSON
+      face-detect [FLAGS] --batch                              stdin → NDJSON
+      face-detect [FLAGS] --watch --in <fifo> --out <fifo>     FIFO daemon
+      face-detect [FLAGS] --video <file> [--fps <rate>]        Video frames → NDJSON
+      face-detect [FLAGS] --bench <folder>                     Throughput benchmark
+
+    GLOBAL FLAGS
+      --engine adaface|vision    Embedding engine (default: adaface, fallback vision)
+      --min-quality 0.0-1.0      Skip faces below threshold (default: 0)
 
     SUPPORTED FORMATS
       HEIC, JPEG, PNG, TIFF
 
     OUTPUT
-      Each result is a JSON object with: image, width, height, elapsed_ms, faces[], error.
-      Each face has: bbox [x,y,w,h], confidence, quality, roll, yaw, pitch,
-      embedding (768 floats), landmarks {region: [[x,y],...]}.
+      JSON: image, width, height, elapsed_ms, engine, engine_dim,
+            description, tags[], faces[], error.
+      Each face: bbox [x,y,w,h], confidence, quality, roll/yaw/pitch,
+                 embedding (512 floats AdaFace | 768 Vision), landmarks {region: [[x,y]]}.
 
-    EMBEDDING
-      768-dimensional feature vector from VNGenerateImageFeaturePrintRequest.
-      Generated by cropping each detected face (+20% padding) and computing
-      an image feature print. Useful for face similarity/clustering.
+    EMBEDDING ENGINES
+      adaface (default): AdaFace IR-18 Core ML, 512-dim L2-normalized,
+        face-recognition specific. Best for identity clustering.
+        Model loaded from FACE_DETECT_MODEL_PATH or
+        /opt/homebrew/share/face-detect/AdaFace_IR18.mlpackage
+      vision: VNGenerateImageFeaturePrintRequest, 768-dim generic image similarity.
+        Fallback when AdaFace model not found. Not face-specific.
     """)
 
 default:
