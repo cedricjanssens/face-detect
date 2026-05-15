@@ -37,8 +37,15 @@ struct ImageResult: Encodable {
     let width: Int
     let height: Int
     let elapsed_ms: Int
+    let description: String?
+    let tags: [TagResult]?
     let faces: [FaceResult]?
     let error: String?
+}
+
+struct TagResult: Encodable {
+    let label: String
+    let confidence: Float
 }
 
 struct FaceResult: Encodable {
@@ -149,6 +156,66 @@ func extractEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
     return floats
 }
 
+// MARK: - Description generation
+
+func generateDescription(faceCount: Int, tags: [TagResult]) -> String {
+    let tagSet = Set(tags.map { $0.label })
+
+    // Subject
+    var subject: String
+    if faceCount == 0 {
+        subject = ""
+    } else if faceCount == 1 {
+        if tagSet.contains("baby") { subject = "bébé" }
+        else if tagSet.contains("child") { subject = "enfant" }
+        else { subject = "personne" }
+    } else {
+        if tagSet.contains("baby") || tagSet.contains("child") {
+            subject = "groupe de \(faceCount) personnes avec enfant(s)"
+        } else {
+            subject = "groupe de \(faceCount) personnes"
+        }
+    }
+
+    // Setting
+    var setting = ""
+    if tagSet.contains("outdoor") || tagSet.contains("sky") || tagSet.contains("land") {
+        setting = "en extérieur"
+    } else if tagSet.contains("structure") || tagSet.contains("furniture") || tagSet.contains("room") {
+        setting = "en intérieur"
+    }
+
+    // Activity / context keywords
+    var details: [String] = []
+    let contextMap: [(String, String)] = [
+        ("food", "repas"), ("drink", "boisson"), ("cake", "gâteau"),
+        ("beach", "plage"), ("snow", "neige"), ("mountain", "montagne"),
+        ("water", "eau"), ("pool", "piscine"), ("garden", "jardin"),
+        ("grass", "herbe"), ("tree", "arbre"), ("flower", "fleur"),
+        ("car", "voiture"), ("vehicle", "véhicule"),
+        ("sport", "sport"), ("ball", "ballon"),
+        ("animal", "animal"), ("dog", "chien"), ("cat", "chat"),
+        ("celebration", "fête"), ("party", "fête"),
+    ]
+    for (tag, fr) in contextMap {
+        if tagSet.contains(tag) { details.append(fr); break }
+    }
+
+    // Assemble
+    var parts: [String] = []
+    if !subject.isEmpty { parts.append(subject) }
+    if !setting.isEmpty { parts.append(setting) }
+    parts.append(contentsOf: details)
+
+    if parts.isEmpty {
+        // Fallback: top tag
+        if let first = tags.first { return first.label }
+        return "image"
+    }
+
+    return parts.joined(separator: ", ")
+}
+
 // MARK: - Core pipeline
 
 func processImage(path: String, cgImage: CGImage) -> ImageResult {
@@ -156,17 +223,24 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
     let w = cgImage.width
     let h = cgImage.height
 
-    // Phase 1: face detection + landmarks (single pass)
+    // Phase 1: face detection + landmarks + image classification (single pass)
     let landmarksReq = VNDetectFaceLandmarksRequest()
+    let classifyReq = VNClassifyImageRequest()
     let handler = VNImageRequestHandler(cgImage: cgImage)
 
     do {
-        try handler.perform([landmarksReq])
+        try handler.perform([landmarksReq, classifyReq])
     } catch {
         let ms = elapsedMs(since: start)
-        return ImageResult(image: path, width: w, height: h, elapsed_ms: ms, faces: nil,
+        return ImageResult(image: path, width: w, height: h, elapsed_ms: ms, description: nil, tags: nil, faces: nil,
                            error: "vision failed: \(error.localizedDescription)")
     }
+
+    // Extract tags (confidence > 0.3, sorted by confidence)
+    let tags: [TagResult] = (classifyReq.results ?? [])
+        .filter { $0.confidence > 0.3 }
+        .sorted { $0.confidence > $1.confidence }
+        .map { TagResult(label: $0.identifier, confidence: $0.confidence) }
 
     let observations = landmarksReq.results ?? []
 
@@ -204,7 +278,8 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
     }
 
     let ms = elapsedMs(since: start)
-    return ImageResult(image: path, width: w, height: h, elapsed_ms: ms, faces: faces, error: nil)
+    let desc = generateDescription(faceCount: faces.count, tags: tags)
+    return ImageResult(image: path, width: w, height: h, elapsed_ms: ms, description: desc, tags: tags, faces: faces, error: nil)
 }
 
 func elapsedMs(since start: DispatchTime) -> Int {
@@ -232,7 +307,7 @@ func cmdBatch() {
                 emit(processImage(path: path, cgImage: cg))
             } else {
                 emit(ImageResult(image: path, width: 0, height: 0, elapsed_ms: 0,
-                                 faces: nil, error: "cannot load image"))
+                                 description: nil, tags: nil, faces: nil, error: "cannot load image"))
             }
         }
     }
@@ -286,7 +361,7 @@ func cmdWatch(inPath: String, outPath: String) {
                         result = processImage(path: line, cgImage: cg)
                     } else {
                         result = ImageResult(image: line, width: 0, height: 0, elapsed_ms: 0,
-                                             faces: nil, error: "cannot load image")
+                                             description: nil, tags: nil, faces: nil, error: "cannot load image")
                     }
                     let enc = JSONEncoder()
                     enc.outputFormatting = [.sortedKeys]
@@ -349,7 +424,7 @@ func cmdVideo(path: String, fps: Double) {
                 emit(result)
             } else {
                 emit(ImageResult(image: label, width: 0, height: 0, elapsed_ms: 0,
-                                 faces: nil, error: frameError?.localizedDescription ?? "frame extraction failed"))
+                                 description: nil, tags: nil, faces: nil, error: frameError?.localizedDescription ?? "frame extraction failed"))
             }
         }
         t += interval
