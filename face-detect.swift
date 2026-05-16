@@ -281,15 +281,72 @@ func croppedFaceImage(cgImage: CGImage, bbox: CGRect) -> CGImage? {
     return cgImage.cropping(to: pixelRect)
 }
 
-// AdaFace: 512-dim L2-normalized embedding via Core ML (Neural Engine when possible)
-func extractAdaFaceEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
-    guard let model = adaFaceModel,
-          let cropped = croppedFaceImage(cgImage: cgImage, bbox: bbox) else {
-        return []
+// MARK: - Face alignment (ArcFace/AdaFace canonical template)
+
+// ArcFace/AdaFace canonical eye positions in 112x112 (CG bottom-left origin)
+private let kAlignLeftEye  = CGPoint(x: 38.2946, y: 112.0 - 51.6963)
+private let kAlignRightEye = CGPoint(x: 73.5318, y: 112.0 - 51.5014)
+
+/// Produce a 112x112 face image aligned via similarity transform on eye positions.
+/// Falls back to simple bbox crop if landmarks are unavailable.
+func alignedFaceImage(cgImage: CGImage, face: VNFaceObservation) -> CGImage? {
+    guard let lm = face.landmarks,
+          let lp = lm.leftPupil, lp.pointCount > 0,
+          let rp = lm.rightPupil, rp.pointCount > 0 else {
+        return croppedFaceImage(cgImage: cgImage, bbox: face.boundingBox)
     }
+
+    let bb = face.boundingBox
+    let imgW = CGFloat(cgImage.width)
+    let imgH = CGFloat(cgImage.height)
+
+    // Source eye positions in pixel coords (CG bottom-left origin)
+    let sl = CGPoint(
+        x: (bb.minX + CGFloat(lp.normalizedPoints[0].x) * bb.width) * imgW,
+        y: (bb.minY + CGFloat(lp.normalizedPoints[0].y) * bb.height) * imgH)
+    let sr = CGPoint(
+        x: (bb.minX + CGFloat(rp.normalizedPoints[0].x) * bb.width) * imgW,
+        y: (bb.minY + CGFloat(rp.normalizedPoints[0].y) * bb.height) * imgH)
+
+    // Similarity transform: template = [[a,-b],[b,a]] * source + [tx,ty]
+    // Solved from 2 point pairs (left eye, right eye)
+    let dx = sr.x - sl.x, dy = sr.y - sl.y
+    let denom = dx * dx + dy * dy
+    guard denom > 1 else { return croppedFaceImage(cgImage: cgImage, bbox: bb) }
+
+    let tdx = kAlignRightEye.x - kAlignLeftEye.x
+    let tdy = kAlignRightEye.y - kAlignLeftEye.y
+    let a = (tdx * dx + tdy * dy) / denom
+    let b = (tdy * dx - tdx * dy) / denom
+    let tx = kAlignLeftEye.x - a * sl.x + b * sl.y
+    let ty = kAlignLeftEye.y - b * sl.x - a * sl.y
+
+    // CGAffineTransform: x'=a*x+c*y+tx, y'=b*x+d*y+ty
+    let xform = CGAffineTransform(a: a, b: b, c: -b, d: a, tx: tx, ty: ty)
+
+    // Render into 112x112 context (CG bottom-left origin matches VN)
+    let sz = 112
+    guard let ctx = CGContext(data: nil, width: sz, height: sz,
+                              bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+        return croppedFaceImage(cgImage: cgImage, bbox: bb)
+    }
+    ctx.interpolationQuality = .high
+    ctx.concatenate(xform)
+    ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: imgW, height: imgH))
+    return ctx.makeImage()
+}
+
+// AdaFace: 512-dim L2-normalized embedding via Core ML (Neural Engine when possible)
+func extractAdaFaceEmbedding(cgImage: CGImage, face: VNFaceObservation) -> [Float] {
+    guard let model = adaFaceModel else { return [] }
+    // Use aligned face when landmarks available, fall back to bbox crop
+    guard let aligned = alignedFaceImage(cgImage: cgImage, face: face) else { return [] }
+
     let request = VNCoreMLRequest(model: model)
     request.imageCropAndScaleOption = .scaleFill
-    let handler = VNImageRequestHandler(cgImage: cropped)
+    let handler = VNImageRequestHandler(cgImage: aligned)
     do {
         try handler.perform([request])
     } catch {
@@ -326,10 +383,10 @@ func extractVisionEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
     return floats
 }
 
-func extractEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
+func extractEmbedding(cgImage: CGImage, face: VNFaceObservation) -> [Float] {
     switch activeEngine {
-    case .adaface: return extractAdaFaceEmbedding(cgImage: cgImage, bbox: bbox)
-    case .vision:  return extractVisionEmbedding(cgImage: cgImage, bbox: bbox)
+    case .adaface: return extractAdaFaceEmbedding(cgImage: cgImage, face: face)
+    case .vision:  return extractVisionEmbedding(cgImage: cgImage, bbox: face.boundingBox)
     }
 }
 
@@ -487,7 +544,7 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
         if let q = q, minQuality > 0, q < minQuality { continue }
 
         let bb = obs.boundingBox
-        let embedding = extractEmbedding(cgImage: cgImage, bbox: bb)
+        let embedding = extractEmbedding(cgImage: cgImage, face: obs)
         let lm = extractLandmarks(face: obs)
 
         let face = FaceResult(
