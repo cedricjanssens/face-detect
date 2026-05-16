@@ -94,7 +94,7 @@ mlmodel = ct.convert(
         shape=(1, 3, 112, 112),
         scale=1.0 / 127.5,
         bias=[-1.0, -1.0, -1.0],
-        color_layout="RGB",
+        color_layout="BGR",  # match IR-18 (john-rocky); VNCoreMLRequest feeds BGR
     )],
     outputs=[ct.TensorType(name="embedding")],
     convert_to="mlprogram",

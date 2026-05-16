@@ -227,7 +227,9 @@ func locateModel() -> URL? {
 
 func loadAdaFaceModel() {
     guard let modelURL = locateModel() else {
-        FileHandle.standardError.write(Data("face-detect: AdaFace \(adaFaceVariant.rawValue) model not found, falling back to Vision FeaturePrint (768d)\n".utf8))
+        let v = adaFaceVariant.rawValue
+        FileHandle.standardError.write(Data("face-detect: AdaFace \(v) model not found, falling back to Vision (768d)\n".utf8))
+        FileHandle.standardError.write(Data("  install: make face-detect-models-\(v)  OR  helpers/face-detect/scripts/install-models.sh \(v)\n".utf8))
         activeEngine = .vision
         return
     }
