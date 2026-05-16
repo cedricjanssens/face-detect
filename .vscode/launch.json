@@ -1,0 +1,32 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Single image",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/bin/face-detect",
+      "args": ["${input:imagePath}"],
+      "env": { "FACE_DETECT_ALLOW_CLI": "1" },
+      "preLaunchTask": "Build",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Watch mode",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/bin/face-detect",
+      "args": ["--watch", "--in", "/tmp/face-in", "--out", "/tmp/face-out"],
+      "preLaunchTask": "Build",
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "imagePath",
+      "description": "Path to image file",
+      "type": "promptString",
+      "default": "tests/lenna-face.png"
+    }
+  ]
+}

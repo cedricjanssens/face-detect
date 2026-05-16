@@ -145,7 +145,9 @@ Retourne `"faces": []` (tableau vide, pas null), `"description": "image"` comme 
 ### Lancer la suite de non-régression
 
 ```bash
-./helpers/face-detect/tests/run-tests.sh
+make test
+# or directly:
+./tests/run-tests.sh
 ```
 
 45 assertions, 11 groupes de tests. Tolère un daemon face-detect pré-existant (archiviste) sans faux positif au test "zero zombies".

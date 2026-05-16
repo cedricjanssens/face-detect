@@ -29,9 +29,9 @@ Single-file Swift CLI that combines Apple Vision (detection, landmarks, quality,
 ## 🚀 Quick start
 
 ```bash
-make face-detect          # builds bin/face-detect
-make face-detect-model    # downloads AdaFace IR-18 (~42 MB)
-make install              # → /usr/local/bin/ or /opt/homebrew/bin/
+make build                # builds bin/face-detect
+make models               # downloads AdaFace IR-18 (~42 MB)
+make install              # → /opt/homebrew/bin/face-detect
 
 face-detect photo.jpg     # JSON output
 ```
