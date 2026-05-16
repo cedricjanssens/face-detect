@@ -795,8 +795,10 @@ func runWatchSession(
                         uptime_ms: uptimeMs(),
                         processed: processed
                     ), to: outHandle)
-                    outHandle.synchronizeFile()
-                    outHandle.closeFile()
+                    // synchronizeFile()/closeFile() raise NSException on socket fds
+                    // (fsync returns EINVAL → NSFileHandleOperationException → SIGABRT).
+                    // Skip them: kernel flushes pending writes on _exit, and the close
+                    // happens implicitly when the process dies.
                     _exit(0)
                 }
 
