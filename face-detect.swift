@@ -27,6 +27,16 @@ func die(_ msg: String, code: Int32 = 1) -> Never {
     exit(code)
 }
 
+func shell(_ cmd: String) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+    p.arguments = ["-c", cmd]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do { try p.run(); p.waitUntilExit(); return p.terminationStatus }
+    catch { return -1 }
+}
+
 func emit<T: Encodable>(_ value: T, pretty: Bool = false) {
     let enc = JSONEncoder()
     enc.outputFormatting = pretty ? [.sortedKeys, .prettyPrinted] : [.sortedKeys]
@@ -234,6 +244,18 @@ func loadAdaFaceModel() {
         return
     }
 
+    // Detect ANE contention: if Ollama/MLX is running, force CPU+GPU to avoid kernel deadlock.
+    // The Neural Engine is a shared resource with no kernel-level timeout — concurrent access
+    // from CoreML + Ollama MLX causes UE (uninterruptible) state that survives SIGKILL.
+    let config = MLModelConfiguration()
+    let ollamaRunning = (shell("pgrep -x ollama") == 0)
+    if ollamaRunning || ProcessInfo.processInfo.environment["FACE_DETECT_NO_ANE"] == "1" {
+        config.computeUnits = .cpuAndGPU
+        FileHandle.standardError.write(Data("face-detect: ANE skipped (\(ollamaRunning ? "ollama running" : "FACE_DETECT_NO_ANE")), using CPU+GPU\n".utf8))
+    } else {
+        config.computeUnits = .all  // Neural Engine when available
+    }
+
     // Load model with timeout — compileModel can deadlock on Neural Engine
     // when another process (Ollama/MLX) holds the ANE.
     let sem = DispatchSemaphore(value: 0)
@@ -243,7 +265,7 @@ func loadAdaFaceModel() {
     DispatchQueue.global(qos: .userInitiated).async {
         do {
             let compiled = try MLModel.compileModel(at: modelURL)
-            let model = try MLModel(contentsOf: compiled)
+            let model = try MLModel(contentsOf: compiled, configuration: config)
             loadedModel = try VNCoreMLModel(for: model)
         } catch {
             loadError = error
