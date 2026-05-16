@@ -18,7 +18,7 @@ import CoreML
 import Foundation
 import Vision
 
-let VERSION = "0.5.0"
+let VERSION = "0.5.1"
 
 // MARK: - Utilities
 
