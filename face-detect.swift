@@ -18,7 +18,7 @@ import CoreML
 import Foundation
 import Vision
 
-let VERSION = "0.6.0"
+let VERSION = "0.6.1"
 
 // MARK: - Utilities
 
@@ -256,6 +256,11 @@ var globalTimeoutSec: Int = 30
 var idleTimeoutSec: UInt32 = 1800  // 30 min default for watch mode
 var predictTimeoutSec: UInt32 = 60 // per-image watchdog (watch mode); exits if a single predict blocks > N sec
 var watchdogInPredict: Int32 = 0   // sig_atomic_t: 1 inside processImage(), 0 otherwise. Reads in signal handler must be lock-free.
+
+// Socket path retained for SIGTERM/SIGINT cleanup. unlink(2) is async-signal-safe.
+// Stored as a C string in a static buffer so the signal handler can read it without
+// touching Swift String machinery (not signal-safe).
+var socketCleanupPath: UnsafeMutablePointer<CChar>? = nil
 
 func modelLabel() -> String? {
     activeEngine == .adaface ? adaFaceVariant.rawValue : nil
@@ -692,11 +697,13 @@ func installWatchSignalHandlers() {
     signal(SIGTERM) { _ in
         let msg: StaticString = "face-detect: SIGTERM, exiting\n"
         _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
+        if let p = socketCleanupPath { _ = unlink(p) }
         _exit(0)
     }
     signal(SIGINT) { _ in
         let msg: StaticString = "face-detect: SIGINT, exiting\n"
         _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
+        if let p = socketCleanupPath { _ = unlink(p) }
         _exit(0)
     }
 
@@ -709,10 +716,12 @@ func installWatchSignalHandlers() {
         if watchdogInPredict != 0 {
             let msg: StaticString = "face-detect: predict watchdog fired (>predict-timeout, likely ANE/CoreML deadlock), exiting 124\n"
             _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
+            if let p = socketCleanupPath { _ = unlink(p) }
             _exit(124)
         } else {
             let msg: StaticString = "face-detect: idle timeout, exiting\n"
             _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
+            if let p = socketCleanupPath { _ = unlink(p) }
             _exit(0)
         }
     }
@@ -799,6 +808,7 @@ func runWatchSession(
                     // (fsync returns EINVAL → NSFileHandleOperationException → SIGABRT).
                     // Skip them: kernel flushes pending writes on _exit, and the close
                     // happens implicitly when the process dies.
+                    if let p = socketCleanupPath { _ = unlink(p) }
                     _exit(0)
                 }
 
@@ -827,8 +837,15 @@ func runWatchSession(
                     watchdogInPredict = 1
                     alarm(predictTimeoutSec)
                     result = processImage(path: path, cgImage: cg)
-                    watchdogInPredict = 0
+                    // Order matters: rearm the (long) idle alarm BEFORE clearing the
+                    // flag. Otherwise a SIGALRM that fired right at the predict deadline
+                    // but hasn't been delivered yet would be misclassified as idle (exit 0)
+                    // instead of predict-watchdog (exit 124) — or worse, a freshly rearmed
+                    // idle alarm could be wrongly seen as a predict timeout. After alarm()
+                    // returns, the next signal is the new (idle) one, far in the future,
+                    // so the flag clear that follows is race-free.
                     alarm(idleTimeoutSec)
+                    watchdogInPredict = 0
                 } else {
                     result = ImageResult(
                         image: path, width: 0, height: 0, elapsed_ms: 0,
@@ -893,6 +910,11 @@ func cmdWatchSocket(socketPath: String) {
     // Remove stale socket file from previous run (e.g. crash, no graceful unlink).
     // unlink() returning ENOENT is harmless.
     _ = unlink(socketPath)
+
+    // Allocate a C string copy for the signal-handler cleanup path. Stays alive
+    // for process lifetime. strdup is async-signal-safe to USE (read), not to
+    // ALLOCATE — we call it here, well before any signal can fire on this path.
+    socketCleanupPath = strdup(socketPath)
 
     let serverFd = socket(AF_UNIX, SOCK_STREAM, 0)
     if serverFd < 0 { die("socket() failed: \(String(cString: strerror(errno)))") }

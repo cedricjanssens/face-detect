@@ -5,6 +5,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · Versioning: 
 
 ---
 
+## [0.6.1] — 2026-05-17
+
+### 🛡️ Hardening after code review
+
+#### Fixed
+- **Watchdog flag race** — rearm idle alarm BEFORE clearing `watchdogInPredict`.
+  Previous order could misclassify a SIGALRM delivered right at the predict
+  deadline: handler reads flag=0 → exit 0 (idle) instead of exit 124 (watchdog).
+  Hard to trigger but real, especially under high load.
+- **Socket file leak on signal-driven exit** — SIGTERM/SIGINT/SIGALRM handlers
+  now `unlink(socketCleanupPath)` before `_exit()`. `unlink(2)` is async-signal-safe,
+  the path is held as a heap-allocated C string (strdup) to avoid touching Swift
+  String machinery from a signal handler. Startup `unlink()` continues to cover
+  the SIGKILL / crash case.
+- Shutdown via JSON now also unlinks the socket file (parity with signal exits).
+
+No protocol changes. Drop-in upgrade from 0.6.0.
+
+---
+
 ## [0.5.5] — 2026-05-16
 
 ### 📉 Compact embedding output (mitigate macOS FIFO 16 KB stall)
