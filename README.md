@@ -111,8 +111,8 @@ echo '{"ping":true,"id":"hb-42"}' > /tmp/face-in
 
 **Output** (NDJSON on `/tmp/face-out`):
 
-- Image request → standard `ImageResult` JSON, with `request_id` field if provided
-- Ping → `{"pong": true, "request_id": "...", "uptime_ms": 12345, "processed": 87, "engine": "adaface", "engine_dim": 512}`
+- Image request → standard `ImageResult` JSON, with `id` field if provided
+- Ping → `{"pong": true, "id": "...", "uptime_ms": 12345, "processed": 87, "engine": "adaface", "engine_dim": 512, "model": "ir18"}`
 
 **Daemon behavior**:
 - 🔁 Reconnects automatically when writer disconnects
@@ -346,6 +346,16 @@ find ~/Photos -name "*.jpg" \
 
 MIT. AdaFace model: MIT (upstream [mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace)).
 Core ML conversion: [john-rocky/CoreML-Models](https://github.com/john-rocky/CoreML-Models).
+
+---
+
+## Troubleshooting
+
+See [FAQ.md](FAQ.md) — covers common issues:
+- Watch mode hangs (FIFO buffer saturation)
+- Neural Engine / Ollama contention
+- Integration patterns (Node.js, Python)
+- Model selection (IR-18 vs IR-50)
 
 ---
 

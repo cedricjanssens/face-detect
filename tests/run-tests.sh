@@ -38,6 +38,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Snapshot pre-existing face-detect PIDs (e.g. archiviste daemon) — exclude from zombie check
+PRE_EXISTING_PIDS=$(pgrep -x face-detect 2>/dev/null || true)
+
 # Verify binary exists
 if [[ ! -x "$BINARY" ]]; then
     red "Binary not found or not executable: $BINARY"
@@ -233,9 +236,16 @@ rm -f /tmp/fd-test-in /tmp/fd-test-out
 # ─── Test 10: No zombies ──────────────────────────────────────────
 bold "Test 11: Zero zombies"
 set +o pipefail
-ZOMBIES=$(pgrep -x face-detect 2>/dev/null | wc -l | tr -d ' ')
+# Count only NEW face-detect processes (exclude pre-existing ones like archiviste daemon)
+CURRENT_PIDS=$(pgrep -x face-detect 2>/dev/null || true)
+ZOMBIES=0
+for pid in $CURRENT_PIDS; do
+    if ! echo "$PRE_EXISTING_PIDS" | grep -qw "$pid"; then
+        ZOMBIES=$((ZOMBIES + 1))
+    fi
+done
 set -o pipefail
-assert "0 face-detect processes remaining" "[[ ${ZOMBIES:-0} -eq 0 ]]"
+assert "0 face-detect processes remaining" "[[ $ZOMBIES -eq 0 ]]"
 
 # ─── Summary ──────────────────────────────────────────────────────
 echo ""
