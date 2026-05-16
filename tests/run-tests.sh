@@ -2,7 +2,7 @@
 # face-detect non-regression test suite
 # Usage: ./helpers/face-detect/tests/run-tests.sh [path/to/face-detect]
 #
-# Exit codes: 0 = all pass, 1 = failures
+# Exit codes: 0 = all pass, non-zero = number of failures
 set -euo pipefail
 
 BINARY="${1:-./bin/face-detect}"
@@ -27,6 +27,17 @@ assert() {
     fi
 }
 
+# Cleanup trap — kill leftover daemons and remove FIFOs on exit
+cleanup() {
+    set +e
+    [[ -n "${DAEMON_PID:-}" ]] && kill "$DAEMON_PID" 2>/dev/null
+    rm -f /tmp/fd-test-in /tmp/fd-test-out
+    exec 3>&- 2>/dev/null
+    exec 4<&- 2>/dev/null
+    set -e
+}
+trap cleanup EXIT
+
 # Verify binary exists
 if [[ ! -x "$BINARY" ]]; then
     red "Binary not found or not executable: $BINARY"
@@ -36,9 +47,12 @@ fi
 
 # ─── Test 1: CLI mode blocked by default ───────────────────────────
 bold "Test 1: CLI mode blocked without FACE_DETECT_ALLOW_CLI"
-OUTPUT=$(unset FACE_DETECT_ALLOW_CLI; "$BINARY" /dev/null 2>&1 || true)
-assert "exits with error" "[[ \$? -eq 0 ]]"  # the || true masks it
-assert "mentions CLI disabled" "echo '$OUTPUT' | grep -q 'CLI mode disabled'"
+set +e
+CLI_OUTPUT=$(unset FACE_DETECT_ALLOW_CLI; "$BINARY" /dev/null 2>&1)
+CLI_EXIT=$?
+set -e
+assert "exits with non-zero code" "[[ $CLI_EXIT -ne 0 ]]"
+assert "mentions CLI disabled" "echo '$CLI_OUTPUT' | grep -q 'CLI mode disabled'"
 
 # ─── Test 2: Image without face — no crash ─────────────────────────
 bold "Test 2: Image without face (solid blue)"
@@ -56,16 +70,15 @@ EXIT=$?
 assert "exit code 0" "[[ $EXIT -eq 0 ]]"
 FACES=$(echo "$JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['faces']))")
 assert ">=1 face detected" "[[ $FACES -ge 1 ]]"
-# Check embedding
 EMBED_LEN=$(echo "$JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['faces'][0]['embedding']))")
 assert "embedding is 512d (adaface) or 768d (vision)" "[[ $EMBED_LEN -eq 512 || $EMBED_LEN -eq 768 ]]"
-# Check confidence
 CONF=$(echo "$JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"faces\"][0][\"confidence\"]:.1f}')")
 assert "confidence > 0.5" "python3 -c \"exit(0 if $CONF > 0.5 else 1)\""
+# Check model field present
+assert "model field present" "echo '$JSON' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d.get('model') in ('ir18','ir50'), d.get('model')\""
 
 # ─── Test 4: --min-quality clamping ─────────────────────────────────
 bold "Test 4: --min-quality value clamping"
-# min-quality=2.0 should clamp to 1.0 and filter all faces
 JSON=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" --min-quality 2.0 "$DIR/lenna-face.png" 2>/dev/null)
 FACES=$(echo "$JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['faces']))")
 assert "min-quality=2.0 clamped to 1.0, filters all faces" "[[ $FACES -eq 0 ]]"
@@ -80,8 +93,24 @@ assert "vision engine 768d embedding" "[[ $EMBED_LEN -eq 768 ]]"
 ENGINE=$(echo "$JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['engine'])")
 assert "engine field says vision" "[[ '$ENGINE' == 'vision' ]]"
 
-# ─── Test 6: Watch mode — ping + shutdown ──────────────────────────
-bold "Test 6: Watch mode — ping + shutdown protocol"
+# ─── Test 6: --version flag ───────────────────────────────────────
+bold "Test 6: --version"
+VOUT=$("$BINARY" --version 2>/dev/null)
+assert "--version outputs version string" "echo '$VOUT' | grep -q 'face-detect'"
+assert "--version contains engine info" "echo '$VOUT' | grep -q 'engine='"
+
+# ─── Test 7: --lang parameter ─────────────────────────────────────
+bold "Test 7: --lang i18n descriptions"
+JSON_FR=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" --lang fr "$DIR/lenna-face.png" 2>/dev/null)
+DESC_FR=$(echo "$JSON_FR" | python3 -c "import sys,json; print(json.load(sys.stdin).get('description',''))")
+assert "--lang fr produces French description" "echo '$DESC_FR' | grep -qE 'personne|bébé|enfant|image'"
+
+JSON_EN=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" --lang en "$DIR/lenna-face.png" 2>/dev/null)
+DESC_EN=$(echo "$JSON_EN" | python3 -c "import sys,json; print(json.load(sys.stdin).get('description',''))")
+assert "--lang en produces English description" "echo '$DESC_EN' | grep -qE 'person|baby|child|image'"
+
+# ─── Test 8: Watch mode — ping + image + shutdown ──────────────────
+bold "Test 8: Watch mode — ping + image + shutdown protocol"
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 mkfifo /tmp/fd-test-in /tmp/fd-test-out
 
@@ -99,30 +128,33 @@ exec 4</tmp/fd-test-out
 echo '{"ping":true,"id":"test-ping"}' >&3
 read -t 10 RESP <&4
 assert "ping returns pong" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['pong']==True\""
-assert "ping has request_id" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['request_id']=='test-ping'\""
+assert "ping has id field" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['id']=='test-ping'\""
+assert "pong has model field" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert 'model' in d\""
 
 # Process image via watch
 echo "{\"image\":\"$DIR/lenna-face.png\",\"id\":\"test-face\"}" >&3
 read -t 15 RESP <&4
 FACES=$(echo "$RESP" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('faces',[])))")
 assert "watch detects face in Lenna" "[[ $FACES -ge 1 ]]"
-assert "watch has request_id" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d.get('request_id')=='test-face'\""
+assert "watch has id field" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d.get('id')=='test-face'\""
 
 # Shutdown
 echo '{"shutdown":true,"id":"test-shutdown"}' >&3
 read -t 10 RESP <&4
 assert "shutdown response received" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['shutdown']==True\""
+assert "shutdown has id field" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['id']=='test-shutdown'\""
 
 exec 3>&-
 exec 4<&-
 sleep 1
 
 assert "daemon exited after shutdown" "! kill -0 $DAEMON_PID 2>/dev/null"
+DAEMON_PID=""
 
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 
-# ─── Test 7: SIGTERM clean exit ────────────────────────────────────
-bold "Test 7: SIGTERM clean exit"
+# ─── Test 9: SIGTERM clean exit ────────────────────────────────────
+bold "Test 9: SIGTERM clean exit"
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 mkfifo /tmp/fd-test-in /tmp/fd-test-out
 
@@ -137,14 +169,14 @@ exec 4</tmp/fd-test-out
 kill -TERM $DAEMON_PID
 sleep 1
 assert "daemon dies on SIGTERM" "! kill -0 $DAEMON_PID 2>/dev/null"
+DAEMON_PID=""
 
 exec 3>&- 2>/dev/null
 exec 4<&- 2>/dev/null
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 
-# ─── Test 8: No zombies ───────────────────────────────────────────
-bold "Test 8: Zero zombies"
-# Count face-detect processes (excluding this script)
+# ─── Test 10: No zombies ──────────────────────────────────────────
+bold "Test 10: Zero zombies"
 set +o pipefail
 ZOMBIES=$(pgrep -x face-detect 2>/dev/null | wc -l | tr -d ' ')
 set -o pipefail

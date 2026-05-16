@@ -2,20 +2,23 @@
 // Build: swiftc -O -framework AVFoundation -framework CoreML face-detect.swift -o face-detect
 // Requires: macOS 14+, Apple Silicon recommended (Neural Engine).
 //
-// Embeddings: AdaFace IR-18 (Core ML, 512-dim L2-normalized) for face recognition.
+// Embeddings: AdaFace (Core ML, 512-dim L2-normalized) for face recognition.
+//   Models: IR-18 (fast, default) or IR-50 (ResNet-50, more discriminant).
 // Fallback: Vision VNGenerateImageFeaturePrintRequest (768-dim, generic image similarity).
 //
 // Model search paths (in order):
 //   1. $FACE_DETECT_MODEL_PATH
-//   2. <binary_dir>/AdaFace_IR18.mlpackage
-//   3. /opt/homebrew/share/face-detect/AdaFace_IR18.mlpackage
-//   4. /usr/local/share/face-detect/AdaFace_IR18.mlpackage
+//   2. <binary_dir>/AdaFace_<variant>.mlpackage
+//   3. /opt/homebrew/share/face-detect/AdaFace_<variant>.mlpackage
+//   4. /usr/local/share/face-detect/AdaFace_<variant>.mlpackage
 
 import AppKit
 import AVFoundation
 import CoreML
 import Foundation
 import Vision
+
+let VERSION = "0.5.0"
 
 // MARK: - Utilities
 
@@ -24,17 +27,9 @@ func die(_ msg: String, code: Int32 = 1) -> Never {
     exit(code)
 }
 
-func emit<T: Encodable>(_ value: T) {
+func emit<T: Encodable>(_ value: T, pretty: Bool = false) {
     let enc = JSONEncoder()
-    enc.outputFormatting = [.sortedKeys]
-    guard let data = try? enc.encode(value) else { die("encode failed") }
-    FileHandle.standardOutput.write(data)
-    FileHandle.standardOutput.write(Data([0x0a]))
-}
-
-func emitPretty<T: Encodable>(_ value: T) {
-    let enc = JSONEncoder()
-    enc.outputFormatting = [.sortedKeys, .prettyPrinted]
+    enc.outputFormatting = pretty ? [.sortedKeys, .prettyPrinted] : [.sortedKeys]
     guard let data = try? enc.encode(value) else { die("encode failed") }
     FileHandle.standardOutput.write(data)
     FileHandle.standardOutput.write(Data([0x0a]))
@@ -49,6 +44,7 @@ struct ImageResult: Encodable {
     let elapsed_ms: Int
     let engine: String
     let engine_dim: Int
+    let model: String?
     let description: String?
     let tags: [TagResult]?
     let faces: [FaceResult]?
@@ -67,7 +63,7 @@ struct FaceResult: Encodable {
     let roll: Double?
     let yaw: Double?
     let pitch: Double?
-    let embedding: [Float]      // 768 floats (macOS 14+) or empty on failure
+    let embedding: [Float]      // 512 floats (AdaFace) or 768 (Vision)
     let landmarks: [String: [[Double]]]?
 }
 
@@ -89,41 +85,40 @@ struct WatchRequest: Decodable {
     let shutdown: Bool?
 }
 
-// Output for non-image control commands (ping). For image requests,
-// we emit the normal ImageResult, optionally with `request_id` propagated.
 struct PongResponse: Encodable {
     let pong: Bool
-    let request_id: String?
+    let id: String?
     let uptime_ms: Int
     let processed: Int
     let engine: String
     let engine_dim: Int
+    let model: String?
 }
 
 struct ShutdownResponse: Encodable {
     let shutdown: Bool
-    let request_id: String?
+    let id: String?
     let uptime_ms: Int
     let processed: Int
 }
 
-// Wrapper to add request_id to ImageResult without changing the base struct.
-// We encode manually so the field order is deterministic and request_id
+// Wrapper to add id to ImageResult without changing the base struct.
+// We encode manually so the field order is deterministic and id
 // is omitted when absent (back-compat with single-path input format).
 struct IdentifiedImageResult: Encodable {
-    let request_id: String?
+    let id: String?
     let result: ImageResult
 
     enum CodingKeys: String, CodingKey {
-        case request_id
+        case id
     }
 
     func encode(to encoder: Encoder) throws {
-        // Encode ImageResult fields at top level, plus request_id when present.
+        // Encode ImageResult fields at top level, plus id when present.
         try result.encode(to: encoder)
-        if let id = request_id {
+        if let id = id {
             var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(id, forKey: .request_id)
+            try container.encode(id, forKey: .id)
         }
     }
 }
@@ -177,27 +172,50 @@ func extractLandmarks(face: VNFaceObservation) -> [String: [[Double]]]? {
     return result.isEmpty ? nil : result
 }
 
-// MARK: - Embedding engines
+// MARK: - Embedding engines & model variants
 
 enum EmbeddingEngine: String {
     case adaface
     case vision
 }
 
+enum AdaFaceVariant: String {
+    case ir18
+    case ir50
+
+    var modelFileName: String {
+        switch self {
+        case .ir18: return "AdaFace_IR18.mlpackage"
+        case .ir50: return "AdaFace_IR50.mlpackage"
+        }
+    }
+}
+
+enum DescriptionLang: String {
+    case fr, en
+}
+
 // Loaded once at startup, reused for all images.
 var adaFaceModel: VNCoreMLModel?
 var activeEngine: EmbeddingEngine = .adaface
+var adaFaceVariant: AdaFaceVariant = .ir18
+var descLang: DescriptionLang = .fr
 var minQuality: Float = 0.0
 var globalTimeoutSec: Int = 30
 var idleTimeoutSec: UInt32 = 1800  // 30 min default for watch mode
 
+func modelLabel() -> String? {
+    activeEngine == .adaface ? adaFaceVariant.rawValue : nil
+}
+
 func locateModel() -> URL? {
+    let fileName = adaFaceVariant.modelFileName
+    let binaryDir = (CommandLine.arguments.first.map { ($0 as NSString).deletingLastPathComponent } ?? "")
     let candidates: [String] = [
         ProcessInfo.processInfo.environment["FACE_DETECT_MODEL_PATH"] ?? "",
-        Bundle.main.bundlePath + "/AdaFace_IR18.mlpackage",
-        ((CommandLine.arguments.first as NSString?)?.deletingLastPathComponent ?? "") + "/AdaFace_IR18.mlpackage",
-        "/opt/homebrew/share/face-detect/AdaFace_IR18.mlpackage",
-        "/usr/local/share/face-detect/AdaFace_IR18.mlpackage",
+        binaryDir.isEmpty ? "" : binaryDir + "/" + fileName,
+        "/opt/homebrew/share/face-detect/" + fileName,
+        "/usr/local/share/face-detect/" + fileName,
     ]
     for path in candidates where !path.isEmpty {
         if FileManager.default.fileExists(atPath: path) {
@@ -209,7 +227,7 @@ func locateModel() -> URL? {
 
 func loadAdaFaceModel() {
     guard let modelURL = locateModel() else {
-        FileHandle.standardError.write(Data("face-detect: AdaFace model not found, falling back to Vision FeaturePrint (768d)\n".utf8))
+        FileHandle.standardError.write(Data("face-detect: AdaFace \(adaFaceVariant.rawValue) model not found, falling back to Vision FeaturePrint (768d)\n".utf8))
         activeEngine = .vision
         return
     }
@@ -279,9 +297,13 @@ func extractAdaFaceEmbedding(cgImage: CGImage, bbox: CGRect) -> [Float] {
           let array = result.featureValue.multiArrayValue else {
         return []
     }
-    var floats = [Float](repeating: 0, count: array.count)
-    for i in 0..<array.count {
-        floats[i] = Float(array[i].doubleValue)
+    let count = array.count
+    var floats = [Float](repeating: 0, count: count)
+    // Bulk copy when data is already Float32 (avoids NSNumber boxing per element)
+    if array.dataType == .float32 {
+        memcpy(&floats, array.dataPointer, count * MemoryLayout<Float>.size)
+    } else {
+        for i in 0..<count { floats[i] = Float(array[i].doubleValue) }
     }
     return floats
 }
@@ -316,9 +338,57 @@ func engineDim() -> Int {
     }
 }
 
-// MARK: - Description generation
+// MARK: - Description generation (i18n)
+
+struct DescStrings {
+    let person: String
+    let baby: String
+    let child: String
+    let groupFmt: String       // must contain %d
+    let groupChildFmt: String  // must contain %d
+    let outdoor: String
+    let indoor: String
+    let fallback: String
+    let context: [(tag: String, word: String)]
+}
+
+let descTable: [DescriptionLang: DescStrings] = [
+    .fr: DescStrings(
+        person: "personne", baby: "bébé", child: "enfant",
+        groupFmt: "groupe de %d personnes",
+        groupChildFmt: "groupe de %d personnes avec enfant(s)",
+        outdoor: "en extérieur", indoor: "en intérieur", fallback: "image",
+        context: [
+            ("food", "repas"), ("drink", "boisson"), ("cake", "gâteau"),
+            ("beach", "plage"), ("snow", "neige"), ("mountain", "montagne"),
+            ("water", "eau"), ("pool", "piscine"), ("garden", "jardin"),
+            ("grass", "herbe"), ("tree", "arbre"), ("flower", "fleur"),
+            ("car", "voiture"), ("vehicle", "véhicule"),
+            ("sport", "sport"), ("ball", "ballon"),
+            ("animal", "animal"), ("dog", "chien"), ("cat", "chat"),
+            ("celebration", "fête"), ("party", "fête"),
+        ]
+    ),
+    .en: DescStrings(
+        person: "person", baby: "baby", child: "child",
+        groupFmt: "group of %d people",
+        groupChildFmt: "group of %d people with child(ren)",
+        outdoor: "outdoors", indoor: "indoors", fallback: "image",
+        context: [
+            ("food", "meal"), ("drink", "drink"), ("cake", "cake"),
+            ("beach", "beach"), ("snow", "snow"), ("mountain", "mountain"),
+            ("water", "water"), ("pool", "pool"), ("garden", "garden"),
+            ("grass", "grass"), ("tree", "tree"), ("flower", "flower"),
+            ("car", "car"), ("vehicle", "vehicle"),
+            ("sport", "sport"), ("ball", "ball"),
+            ("animal", "animal"), ("dog", "dog"), ("cat", "cat"),
+            ("celebration", "celebration"), ("party", "party"),
+        ]
+    ),
+]
 
 func generateDescription(faceCount: Int, tags: [TagResult]) -> String {
+    let s = descTable[descLang]!
     let tagSet = Set(tags.map { $0.label })
 
     // Subject
@@ -326,39 +396,29 @@ func generateDescription(faceCount: Int, tags: [TagResult]) -> String {
     if faceCount == 0 {
         subject = ""
     } else if faceCount == 1 {
-        if tagSet.contains("baby") { subject = "bébé" }
-        else if tagSet.contains("child") { subject = "enfant" }
-        else { subject = "personne" }
+        if tagSet.contains("baby") { subject = s.baby }
+        else if tagSet.contains("child") { subject = s.child }
+        else { subject = s.person }
     } else {
         if tagSet.contains("baby") || tagSet.contains("child") {
-            subject = "groupe de \(faceCount) personnes avec enfant(s)"
+            subject = String(format: s.groupChildFmt, faceCount)
         } else {
-            subject = "groupe de \(faceCount) personnes"
+            subject = String(format: s.groupFmt, faceCount)
         }
     }
 
     // Setting
     var setting = ""
     if tagSet.contains("outdoor") || tagSet.contains("sky") || tagSet.contains("land") {
-        setting = "en extérieur"
+        setting = s.outdoor
     } else if tagSet.contains("structure") || tagSet.contains("furniture") || tagSet.contains("room") {
-        setting = "en intérieur"
+        setting = s.indoor
     }
 
-    // Activity / context keywords
+    // Activity / context keywords (first match wins)
     var details: [String] = []
-    let contextMap: [(String, String)] = [
-        ("food", "repas"), ("drink", "boisson"), ("cake", "gâteau"),
-        ("beach", "plage"), ("snow", "neige"), ("mountain", "montagne"),
-        ("water", "eau"), ("pool", "piscine"), ("garden", "jardin"),
-        ("grass", "herbe"), ("tree", "arbre"), ("flower", "fleur"),
-        ("car", "voiture"), ("vehicle", "véhicule"),
-        ("sport", "sport"), ("ball", "ballon"),
-        ("animal", "animal"), ("dog", "chien"), ("cat", "chat"),
-        ("celebration", "fête"), ("party", "fête"),
-    ]
-    for (tag, fr) in contextMap {
-        if tagSet.contains(tag) { details.append(fr); break }
+    for (tag, word) in s.context {
+        if tagSet.contains(tag) { details.append(word); break }
     }
 
     // Assemble
@@ -368,9 +428,8 @@ func generateDescription(faceCount: Int, tags: [TagResult]) -> String {
     parts.append(contentsOf: details)
 
     if parts.isEmpty {
-        // Fallback: top tag
         if let first = tags.first { return first.label }
-        return "image"
+        return s.fallback
     }
 
     return parts.joined(separator: ", ")
@@ -394,6 +453,7 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
         let ms = elapsedMs(since: start)
         return ImageResult(image: path, width: w, height: h, elapsed_ms: ms,
                            engine: activeEngine.rawValue, engine_dim: engineDim(),
+                           model: modelLabel(),
                            description: nil, tags: nil, faces: nil,
                            error: "vision failed: \(error.localizedDescription)")
     }
@@ -446,6 +506,7 @@ func processImage(path: String, cgImage: CGImage) -> ImageResult {
     let desc = generateDescription(faceCount: faces.count, tags: tags)
     return ImageResult(image: path, width: w, height: h, elapsed_ms: ms,
                        engine: activeEngine.rawValue, engine_dim: engineDim(),
+                       model: modelLabel(),
                        description: desc, tags: tags, faces: faces, error: nil)
 }
 
@@ -460,21 +521,28 @@ func cmdSingle(_ path: String) {
         die("cannot load image: \(path)")
     }
     let result = processImage(path: path, cgImage: cg)
-    emitPretty(result)
+    emit(result, pretty: true)
 }
 
 // MARK: - Mode: batch (stdin → NDJSON stdout)
 
 func cmdBatch() {
+    var count = 0
     while let line = readLine() {
         let path = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty else { continue }
+        count += 1
         autoreleasepool {
             if let (cg, _, _) = loadCGImage(path: path) {
-                emit(processImage(path: path, cgImage: cg))
+                let result = processImage(path: path, cgImage: cg)
+                let faceCount = result.faces?.count ?? 0
+                FileHandle.standardError.write(Data("[\(count)] \(path): \(faceCount) faces, \(result.elapsed_ms)ms\n".utf8))
+                emit(result)
             } else {
+                FileHandle.standardError.write(Data("[\(count)] \(path): FAILED (cannot load)\n".utf8))
                 emit(ImageResult(image: path, width: 0, height: 0, elapsed_ms: 0,
                                  engine: activeEngine.rawValue, engine_dim: engineDim(),
+                                 model: modelLabel(),
                                  description: nil, tags: nil, faces: nil, error: "cannot load image"))
             }
         }
@@ -487,26 +555,30 @@ func cmdWatch(inPath: String, outPath: String) {
     signal(SIGPIPE, SIG_IGN)
 
     // Graceful shutdown via POSIX signal handlers (not GCD — fires while blocked in read).
-    // Closures must NOT capture context (C function pointer requirement).
+    // Uses StaticString + write(2) + _exit(2) only — fully async-signal-safe.
     signal(SIGTERM) { _ in
-        "face-detect: SIGTERM, exiting\n".withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+        let msg: StaticString = "face-detect: SIGTERM, exiting\n"
+        _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
         _exit(0)
     }
     signal(SIGINT) { _ in
-        "face-detect: SIGINT, exiting\n".withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+        let msg: StaticString = "face-detect: SIGINT, exiting\n"
+        _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
         _exit(0)
     }
 
     // Idle timeout via POSIX alarm() — kernel-level, fires even if blocked in read().
     // Rearms after each message. Default 30 min, configurable via --idle-timeout.
     signal(SIGALRM) { _ in
-        "face-detect: idle timeout, exiting\n".withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+        let msg: StaticString = "face-detect: idle timeout, exiting\n"
+        _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
         _exit(0)
     }
     alarm(idleTimeoutSec)
 
     let startTime = DispatchTime.now()
     var processed = 0
+    let decoder = JSONDecoder()
 
     func uptimeMs() -> Int {
         Int((DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000)
@@ -524,7 +596,7 @@ func cmdWatch(inPath: String, outPath: String) {
         handle.write(Data([0x0a]))
     }
 
-    logStderr("ready (engine=\(activeEngine.rawValue), dim=\(engineDim()), idle_timeout=\(idleTimeoutSec)s, in=\(inPath), out=\(outPath))")
+    logStderr("ready (engine=\(activeEngine.rawValue), model=\(adaFaceVariant.rawValue), dim=\(engineDim()), idle_timeout=\(idleTimeoutSec)s, in=\(inPath), out=\(outPath))")
 
     while true {
         // Opens block until writer/reader connect
@@ -568,13 +640,14 @@ func cmdWatch(inPath: String, outPath: String) {
 
                     if line.hasPrefix("{") {
                         if let data = line.data(using: .utf8),
-                           let req = try? JSONDecoder().decode(WatchRequest.self, from: data) {
+                           let req = try? decoder.decode(WatchRequest.self, from: data) {
                             requestId = req.id
                             imagePath = req.image
                             isPing = req.ping ?? false
                             isShutdown = req.shutdown ?? false
                         } else {
-                            imagePath = line
+                            logStderr("malformed JSON (parse failed): \(line.prefix(120))")
+                            return
                         }
                     } else {
                         imagePath = line
@@ -585,10 +658,11 @@ func cmdWatch(inPath: String, outPath: String) {
                         logStderr("shutdown requested (processed=\(processed))")
                         emitJSON(ShutdownResponse(
                             shutdown: true,
-                            request_id: requestId,
+                            id: requestId,
                             uptime_ms: uptimeMs(),
                             processed: processed
                         ), to: outHandle)
+                        outHandle.synchronizeFile()
                         outHandle.closeFile()
                         _exit(0)
                     }
@@ -597,17 +671,18 @@ func cmdWatch(inPath: String, outPath: String) {
                     if isPing {
                         emitJSON(PongResponse(
                             pong: true,
-                            request_id: requestId,
+                            id: requestId,
                             uptime_ms: uptimeMs(),
                             processed: processed,
                             engine: activeEngine.rawValue,
-                            engine_dim: engineDim()
+                            engine_dim: engineDim(),
+                            model: modelLabel()
                         ), to: outHandle)
                         return
                     }
 
                     guard let path = imagePath else {
-                        logStderr("malformed request: \(line.prefix(100))")
+                        logStderr("malformed request (no image): \(line.prefix(120))")
                         return
                     }
 
@@ -620,6 +695,7 @@ func cmdWatch(inPath: String, outPath: String) {
                         result = ImageResult(
                             image: path, width: 0, height: 0, elapsed_ms: 0,
                             engine: activeEngine.rawValue, engine_dim: engineDim(),
+                            model: modelLabel(),
                             description: nil, tags: nil, faces: nil, error: "cannot load image"
                         )
                     }
@@ -629,7 +705,7 @@ func cmdWatch(inPath: String, outPath: String) {
                     let errPart = result.error.map { " error=\($0)" } ?? ""
                     logStderr("done \(path) in \(took)ms (\(faceCount) faces)\(errPart)")
 
-                    emitJSON(IdentifiedImageResult(request_id: requestId, result: result), to: outHandle)
+                    emitJSON(IdentifiedImageResult(id: requestId, result: result), to: outHandle)
                 }
             }
         }
@@ -645,6 +721,8 @@ func cmdWatch(inPath: String, outPath: String) {
 // MARK: - Mode: video
 
 func cmdVideo(path: String, fps: Double) {
+    guard fps > 0 else { die("--fps must be > 0 (got \(fps))") }
+
     let url = URL(fileURLWithPath: path)
     let asset = AVURLAsset(url: url)
 
@@ -688,6 +766,7 @@ func cmdVideo(path: String, fps: Double) {
             } else {
                 emit(ImageResult(image: label, width: 0, height: 0, elapsed_ms: 0,
                                  engine: activeEngine.rawValue, engine_dim: engineDim(),
+                                 model: modelLabel(),
                                  description: nil, tags: nil, faces: nil, error: frameError?.localizedDescription ?? "frame extraction failed"))
             }
         }
@@ -736,19 +815,18 @@ func cmdBench(dir: String) {
     let avg = images.count > 0 ? Double(totalMs) / Double(images.count) : 0
     let fps = avg > 0 ? 1000.0 / avg : 0
 
-    emitPretty(BenchResult(
+    emit(BenchResult(
         images: images.count,
         faces: totalFaces,
         total_ms: totalMs,
         avg_ms: (avg * 10).rounded() / 10,
         fps: (fps * 10).rounded() / 10,
         embedding_dim: embeddingDim
-    ))
+    ), pretty: true)
 }
 
 // MARK: - Argument parsing & dispatch
 
-// Extract global flags (--engine, --min-quality) and return remaining args.
 func extractGlobalFlags(_ args: [String]) -> [String] {
     var rest: [String] = []
     var i = 0
@@ -761,6 +839,20 @@ func extractGlobalFlags(_ args: [String]) -> [String] {
                 die("invalid --engine: \(args[i + 1]) (use adaface or vision)")
             }
             i += 2
+        } else if a == "--model", i + 1 < args.count {
+            if let v = AdaFaceVariant(rawValue: args[i + 1]) {
+                adaFaceVariant = v
+            } else {
+                die("invalid --model: \(args[i + 1]) (use ir18 or ir50)")
+            }
+            i += 2
+        } else if a == "--lang", i + 1 < args.count {
+            if let l = DescriptionLang(rawValue: args[i + 1]) {
+                descLang = l
+            } else {
+                die("invalid --lang: \(args[i + 1]) (use fr or en)")
+            }
+            i += 2
         } else if a == "--min-quality", i + 1 < args.count {
             let v = Float(args[i + 1]) ?? 0.0
             minQuality = max(0.0, min(1.0, v))
@@ -769,7 +861,12 @@ func extractGlobalFlags(_ args: [String]) -> [String] {
             globalTimeoutSec = max(1, Int(args[i + 1]) ?? 30)
             i += 2
         } else if a == "--idle-timeout", i + 1 < args.count {
-            idleTimeoutSec = UInt32(max(60, Int(args[i + 1]) ?? 1800))
+            let raw = Int(args[i + 1]) ?? 1800
+            let clamped = max(60, raw)
+            if clamped != raw {
+                FileHandle.standardError.write(Data("face-detect: --idle-timeout clamped from \(raw) to \(clamped)s (minimum 60)\n".utf8))
+            }
+            idleTimeoutSec = UInt32(clamped)
             i += 2
         } else {
             rest.append(a)
@@ -782,31 +879,59 @@ func extractGlobalFlags(_ args: [String]) -> [String] {
 let rawArgs = Array(CommandLine.arguments.dropFirst())
 let args = extractGlobalFlags(rawArgs)
 
+let helpText = """
+face-detect \(VERSION) — face detection + recognition embeddings via Apple Vision + AdaFace.
+
+USAGE
+  face-detect [FLAGS] <image>                              Single image → JSON
+  face-detect [FLAGS] --batch                              stdin → NDJSON
+  face-detect [FLAGS] --watch --in <fifo> --out <fifo>     FIFO daemon
+  face-detect [FLAGS] --video <file> [--fps <rate>]        Video frames → NDJSON
+  face-detect [FLAGS] --bench <folder>                     Throughput benchmark
+
+GLOBAL FLAGS
+  --engine adaface|vision    Embedding engine (default: adaface, fallback vision)
+  --model ir18|ir50          AdaFace variant (default: ir18; ir50 = ResNet-50, more discriminant)
+  --lang fr|en               Description language (default: fr)
+  --min-quality 0.0-1.0      Skip faces below threshold (default: 0)
+  --timeout <seconds>        SIGALRM kill after N seconds (default: 30, CLI modes)
+  --idle-timeout <seconds>   Auto-exit if no request (default: 1800, --watch only, min 60)
+
+SAFETY
+  CLI modes (single, batch, video, bench) are DISABLED by default to prevent
+  zombie processes from Neural Engine deadlocks. Set FACE_DETECT_ALLOW_CLI=1.
+  Even with override, alarm() kills the process after --timeout seconds.
+
+WATCH PROTOCOL
+  Input (FIFO):  {"image":"/path"} or {"ping":true} or {"shutdown":true}
+                 Optional "id" field propagated as "id" in response.
+  Output (FIFO): ImageResult JSON, PongResponse, or ShutdownResponse.
+  Idle timeout:  Process exits after --idle-timeout seconds without activity.
+
+SUPPORTED FORMATS
+  HEIC, JPEG, PNG, TIFF
+
+EMBEDDING ENGINES
+  adaface (default): AdaFace Core ML, 512-dim L2-normalized,
+    face-recognition specific. Best for identity clustering.
+    Variants: ir18 (fast, default), ir50 (ResNet-50, more discriminant).
+    Model loaded from FACE_DETECT_MODEL_PATH or
+    /opt/homebrew/share/face-detect/AdaFace_<variant>.mlpackage
+  vision: VNGenerateImageFeaturePrintRequest, 768-dim generic image similarity.
+    Fallback when AdaFace model not found. Not face-specific.
+"""
+
 if args.isEmpty {
-    die("""
-        usage: face-detect [GLOBAL_FLAGS] <image>
-               face-detect [GLOBAL_FLAGS] --batch
-               face-detect [GLOBAL_FLAGS] --watch --in <fifo> --out <fifo>
-               face-detect [GLOBAL_FLAGS] --video <file> [--fps <rate>]
-               face-detect [GLOBAL_FLAGS] --bench <folder>
-
-        GLOBAL_FLAGS:
-               --engine adaface|vision   (default: adaface)
-               --min-quality 0.0-1.0     (default: 0, no filtering)
-               --timeout <seconds>       (default: 30, CLI modes only)
-               --idle-timeout <seconds>  (default: 1800, --watch only)
-
-        NOTE: CLI modes (single, batch, video, bench) are disabled by default.
-              Set FACE_DETECT_ALLOW_CLI=1 to override.
-        """)
+    die(helpText)
 }
 
-// Safety: only --watch (daemon) and --help are allowed by default.
+// Safety: only --watch, --help, and --version are allowed by default.
 // CLI modes (single, batch, video, bench) can spawn zombie processes
 // if the Neural Engine deadlocks. Override with FACE_DETECT_ALLOW_CLI=1.
 let isWatchMode = args[0] == "--watch"
 let isHelpMode = args[0] == "--help" || args[0] == "-h"
-if !isWatchMode && !isHelpMode {
+let isVersionMode = args[0] == "--version" || args[0] == "-V"
+if !isWatchMode && !isHelpMode && !isVersionMode {
     let allowCLI = ProcessInfo.processInfo.environment["FACE_DETECT_ALLOW_CLI"] == "1"
     if !allowCLI {
         die("CLI mode disabled (zombie risk). Use --watch daemon or set FACE_DETECT_ALLOW_CLI=1 to override.")
@@ -814,15 +939,15 @@ if !isWatchMode && !isHelpMode {
     // Nuclear timeout: POSIX alarm() sends SIGALRM at kernel level.
     // Works even if GCD is deadlocked or process is orphaned by sandbox.
     signal(SIGALRM) { _ in
-        let msg = "face-detect: SIGALRM timeout, force exit\n"
-        msg.withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+        let msg: StaticString = "face-detect: SIGALRM timeout, force exit\n"
+        _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
         _exit(2)
     }
     alarm(UInt32(globalTimeoutSec))
 }
 
 // Load AdaFace model if needed (silent fallback to Vision on failure)
-if activeEngine == .adaface {
+if activeEngine == .adaface && !isHelpMode && !isVersionMode {
     loadAdaFaceModel()
 }
 
@@ -868,44 +993,10 @@ case "--bench":
     cmdBench(dir: args[1])
 
 case "--help", "-h":
-    print("""
-    face-detect — face detection + recognition embeddings via Apple Vision + AdaFace.
+    print(helpText)
 
-    USAGE
-      face-detect [FLAGS] <image>                              Single image → JSON
-      face-detect [FLAGS] --batch                              stdin → NDJSON
-      face-detect [FLAGS] --watch --in <fifo> --out <fifo>     FIFO daemon
-      face-detect [FLAGS] --video <file> [--fps <rate>]        Video frames → NDJSON
-      face-detect [FLAGS] --bench <folder>                     Throughput benchmark
-
-    GLOBAL FLAGS
-      --engine adaface|vision    Embedding engine (default: adaface, fallback vision)
-      --min-quality 0.0-1.0      Skip faces below threshold (default: 0)
-      --timeout <seconds>        SIGALRM kill after N seconds (default: 30, CLI modes)
-      --idle-timeout <seconds>   Auto-exit if no request (default: 1800, --watch only)
-
-    SAFETY
-      CLI modes (single, batch, video, bench) are DISABLED by default to prevent
-      zombie processes from Neural Engine deadlocks. Set FACE_DETECT_ALLOW_CLI=1.
-      Even with override, alarm() kills the process after --timeout seconds.
-
-    WATCH PROTOCOL
-      Input (FIFO):  {"image":"/path"} or {"ping":true} or {"shutdown":true}
-                     Optional "id" field propagated as "request_id" in response.
-      Output (FIFO): ImageResult JSON, PongResponse, or ShutdownResponse.
-      Idle timeout:  Process exits after --idle-timeout seconds without activity.
-
-    SUPPORTED FORMATS
-      HEIC, JPEG, PNG, TIFF
-
-    EMBEDDING ENGINES
-      adaface (default): AdaFace IR-18 Core ML, 512-dim L2-normalized,
-        face-recognition specific. Best for identity clustering.
-        Model loaded from FACE_DETECT_MODEL_PATH or
-        /opt/homebrew/share/face-detect/AdaFace_IR18.mlpackage
-      vision: VNGenerateImageFeaturePrintRequest, 768-dim generic image similarity.
-        Fallback when AdaFace model not found. Not face-specific.
-    """)
+case "--version", "-V":
+    print("face-detect \(VERSION) (engine=\(activeEngine.rawValue), model=\(adaFaceVariant.rawValue), dim=\(engineDim()))")
 
 default:
     cmdSingle(args[0])
