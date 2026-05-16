@@ -86,6 +86,7 @@ struct WatchRequest: Decodable {
     let id: String?
     let image: String?
     let ping: Bool?
+    let shutdown: Bool?
 }
 
 // Output for non-image control commands (ping). For image requests,
@@ -97,6 +98,13 @@ struct PongResponse: Encodable {
     let processed: Int
     let engine: String
     let engine_dim: Int
+}
+
+struct ShutdownResponse: Encodable {
+    let shutdown: Bool
+    let request_id: String?
+    let uptime_ms: Int
+    let processed: Int
 }
 
 // Wrapper to add request_id to ImageResult without changing the base struct.
@@ -180,6 +188,8 @@ enum EmbeddingEngine: String {
 var adaFaceModel: VNCoreMLModel?
 var activeEngine: EmbeddingEngine = .adaface
 var minQuality: Float = 0.0
+var globalTimeoutSec: Int = 30
+var idleTimeoutSec: UInt32 = 1800  // 30 min default for watch mode
 
 func locateModel() -> URL? {
     let candidates: [String] = [
@@ -203,12 +213,35 @@ func loadAdaFaceModel() {
         activeEngine = .vision
         return
     }
-    do {
-        let compiled = try MLModel.compileModel(at: modelURL)
-        let model = try MLModel(contentsOf: compiled)
-        adaFaceModel = try VNCoreMLModel(for: model)
-    } catch {
-        FileHandle.standardError.write(Data("face-detect: model load failed (\(error)), falling back to Vision\n".utf8))
+
+    // Load model with timeout — compileModel can deadlock on Neural Engine
+    // when another process (Ollama/MLX) holds the ANE.
+    let sem = DispatchSemaphore(value: 0)
+    var loadedModel: VNCoreMLModel?
+    var loadError: Error?
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        do {
+            let compiled = try MLModel.compileModel(at: modelURL)
+            let model = try MLModel(contentsOf: compiled)
+            loadedModel = try VNCoreMLModel(for: model)
+        } catch {
+            loadError = error
+        }
+        sem.signal()
+    }
+
+    let timeoutSec = 15
+    if sem.wait(timeout: .now() + .seconds(timeoutSec)) == .timedOut {
+        FileHandle.standardError.write(Data("face-detect: model load timed out (\(timeoutSec)s), falling back to Vision\n".utf8))
+        activeEngine = .vision
+        return
+    }
+
+    if let model = loadedModel {
+        adaFaceModel = model
+    } else {
+        FileHandle.standardError.write(Data("face-detect: model load failed (\(loadError?.localizedDescription ?? "unknown")), falling back to Vision\n".utf8))
         activeEngine = .vision
     }
 }
@@ -453,19 +486,31 @@ func cmdBatch() {
 func cmdWatch(inPath: String, outPath: String) {
     signal(SIGPIPE, SIG_IGN)
 
-    // Graceful shutdown
-    let shutdownSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-    shutdownSrc.setEventHandler { exit(0) }
-    shutdownSrc.resume()
-    signal(SIGTERM, SIG_IGN)
+    // Graceful shutdown via POSIX signal handlers (not GCD — fires while blocked in read).
+    // Closures must NOT capture context (C function pointer requirement).
+    signal(SIGTERM) { _ in
+        "face-detect: SIGTERM, exiting\n".withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+        _exit(0)
+    }
+    signal(SIGINT) { _ in
+        "face-detect: SIGINT, exiting\n".withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+        _exit(0)
+    }
 
-    let intSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-    intSrc.setEventHandler { exit(0) }
-    intSrc.resume()
-    signal(SIGINT, SIG_IGN)
+    // Idle timeout via POSIX alarm() — kernel-level, fires even if blocked in read().
+    // Rearms after each message. Default 30 min, configurable via --idle-timeout.
+    signal(SIGALRM) { _ in
+        "face-detect: idle timeout, exiting\n".withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+        _exit(0)
+    }
+    alarm(idleTimeoutSec)
 
     let startTime = DispatchTime.now()
     var processed = 0
+
+    func uptimeMs() -> Int {
+        Int((DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000)
+    }
 
     func logStderr(_ msg: String) {
         FileHandle.standardError.write(Data("face-detect: \(msg)\n".utf8))
@@ -479,7 +524,7 @@ func cmdWatch(inPath: String, outPath: String) {
         handle.write(Data([0x0a]))
     }
 
-    logStderr("ready (engine=\(activeEngine.rawValue), dim=\(engineDim()), in=\(inPath), out=\(outPath))")
+    logStderr("ready (engine=\(activeEngine.rawValue), dim=\(engineDim()), idle_timeout=\(idleTimeoutSec)s, in=\(inPath), out=\(outPath))")
 
     while true {
         // Opens block until writer/reader connect
@@ -511,11 +556,15 @@ func cmdWatch(inPath: String, outPath: String) {
                         .trimmingCharacters(in: .whitespacesAndNewlines),
                       !line.isEmpty else { continue }
 
+                // Rearm idle timeout on any input
+                alarm(idleTimeoutSec)
+
                 autoreleasepool {
                     // Parse: JSON command, or plain path (back-compat)
                     var requestId: String? = nil
                     var imagePath: String? = nil
                     var isPing = false
+                    var isShutdown = false
 
                     if line.hasPrefix("{") {
                         if let data = line.data(using: .utf8),
@@ -523,21 +572,33 @@ func cmdWatch(inPath: String, outPath: String) {
                             requestId = req.id
                             imagePath = req.image
                             isPing = req.ping ?? false
+                            isShutdown = req.shutdown ?? false
                         } else {
-                            // JSON-looking but unparseable: treat as path
                             imagePath = line
                         }
                     } else {
                         imagePath = line
                     }
 
+                    // Handle shutdown
+                    if isShutdown {
+                        logStderr("shutdown requested (processed=\(processed))")
+                        emitJSON(ShutdownResponse(
+                            shutdown: true,
+                            request_id: requestId,
+                            uptime_ms: uptimeMs(),
+                            processed: processed
+                        ), to: outHandle)
+                        outHandle.closeFile()
+                        _exit(0)
+                    }
+
                     // Handle ping
                     if isPing {
-                        let uptime = Int((DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000)
                         emitJSON(PongResponse(
                             pong: true,
                             request_id: requestId,
-                            uptime_ms: uptime,
+                            uptime_ms: uptimeMs(),
                             processed: processed,
                             engine: activeEngine.rawValue,
                             engine_dim: engineDim()
@@ -576,6 +637,8 @@ func cmdWatch(inPath: String, outPath: String) {
         inHandle.closeFile()
         outHandle.closeFile()
         logStderr("writer disconnected (processed=\(processed)), waiting for reconnect")
+        // Rearm idle timeout after disconnect too
+        alarm(idleTimeoutSec)
     }
 }
 
@@ -699,7 +762,14 @@ func extractGlobalFlags(_ args: [String]) -> [String] {
             }
             i += 2
         } else if a == "--min-quality", i + 1 < args.count {
-            minQuality = Float(args[i + 1]) ?? 0.0
+            let v = Float(args[i + 1]) ?? 0.0
+            minQuality = max(0.0, min(1.0, v))
+            i += 2
+        } else if a == "--timeout", i + 1 < args.count {
+            globalTimeoutSec = max(1, Int(args[i + 1]) ?? 30)
+            i += 2
+        } else if a == "--idle-timeout", i + 1 < args.count {
+            idleTimeoutSec = UInt32(max(60, Int(args[i + 1]) ?? 1800))
             i += 2
         } else {
             rest.append(a)
@@ -723,7 +793,32 @@ if args.isEmpty {
         GLOBAL_FLAGS:
                --engine adaface|vision   (default: adaface)
                --min-quality 0.0-1.0     (default: 0, no filtering)
+               --timeout <seconds>       (default: 30, CLI modes only)
+               --idle-timeout <seconds>  (default: 1800, --watch only)
+
+        NOTE: CLI modes (single, batch, video, bench) are disabled by default.
+              Set FACE_DETECT_ALLOW_CLI=1 to override.
         """)
+}
+
+// Safety: only --watch (daemon) and --help are allowed by default.
+// CLI modes (single, batch, video, bench) can spawn zombie processes
+// if the Neural Engine deadlocks. Override with FACE_DETECT_ALLOW_CLI=1.
+let isWatchMode = args[0] == "--watch"
+let isHelpMode = args[0] == "--help" || args[0] == "-h"
+if !isWatchMode && !isHelpMode {
+    let allowCLI = ProcessInfo.processInfo.environment["FACE_DETECT_ALLOW_CLI"] == "1"
+    if !allowCLI {
+        die("CLI mode disabled (zombie risk). Use --watch daemon or set FACE_DETECT_ALLOW_CLI=1 to override.")
+    }
+    // Nuclear timeout: POSIX alarm() sends SIGALRM at kernel level.
+    // Works even if GCD is deadlocked or process is orphaned by sandbox.
+    signal(SIGALRM) { _ in
+        let msg = "face-detect: SIGALRM timeout, force exit\n"
+        msg.withCString { _ = write(STDERR_FILENO, $0, strlen($0)) }
+        _exit(2)
+    }
+    alarm(UInt32(globalTimeoutSec))
 }
 
 // Load AdaFace model if needed (silent fallback to Vision on failure)
@@ -786,15 +881,22 @@ case "--help", "-h":
     GLOBAL FLAGS
       --engine adaface|vision    Embedding engine (default: adaface, fallback vision)
       --min-quality 0.0-1.0      Skip faces below threshold (default: 0)
+      --timeout <seconds>        SIGALRM kill after N seconds (default: 30, CLI modes)
+      --idle-timeout <seconds>   Auto-exit if no request (default: 1800, --watch only)
+
+    SAFETY
+      CLI modes (single, batch, video, bench) are DISABLED by default to prevent
+      zombie processes from Neural Engine deadlocks. Set FACE_DETECT_ALLOW_CLI=1.
+      Even with override, alarm() kills the process after --timeout seconds.
+
+    WATCH PROTOCOL
+      Input (FIFO):  {"image":"/path"} or {"ping":true} or {"shutdown":true}
+                     Optional "id" field propagated as "request_id" in response.
+      Output (FIFO): ImageResult JSON, PongResponse, or ShutdownResponse.
+      Idle timeout:  Process exits after --idle-timeout seconds without activity.
 
     SUPPORTED FORMATS
       HEIC, JPEG, PNG, TIFF
-
-    OUTPUT
-      JSON: image, width, height, elapsed_ms, engine, engine_dim,
-            description, tags[], faces[], error.
-      Each face: bbox [x,y,w,h], confidence, quality, roll/yaw/pitch,
-                 embedding (512 floats AdaFace | 768 Vision), landmarks {region: [[x,y]]}.
 
     EMBEDDING ENGINES
       adaface (default): AdaFace IR-18 Core ML, 512-dim L2-normalized,
