@@ -54,28 +54,42 @@ set -e
 assert "exits with non-zero code" "[[ $CLI_EXIT -ne 0 ]]"
 assert "mentions CLI disabled" "echo '$CLI_OUTPUT' | grep -q 'CLI mode disabled'"
 
-# ─── Test 2: Image without face — no crash ─────────────────────────
+# ─── Test 2: Image without face — no crash, expected output ────────
 bold "Test 2: Image without face (solid blue)"
 JSON=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" "$DIR/solid-blue-noface.png" 2>/dev/null)
 EXIT=$?
 assert "exit code 0" "[[ $EXIT -eq 0 ]]"
+assert "valid JSON structure" "echo '$JSON' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert all(k in d for k in ('image','width','height','elapsed_ms','engine','engine_dim','faces'))\""
 FACES=$(echo "$JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['faces']))")
 assert "0 faces detected" "[[ $FACES -eq 0 ]]"
-assert "valid JSON with image field" "echo '$JSON' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert 'image' in d\""
+DESC=$(echo "$JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('description',''))")
+assert "description is 'image' (no face fallback)" "[[ '$DESC' == 'image' ]]"
 
-# ─── Test 3: Image with face — detection works ─────────────────────
-bold "Test 3: Image with face (Lenna)"
-JSON=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" "$DIR/lenna-face.png" 2>/dev/null)
+# ─── Test 3: Image with face — detection + golden values ──────────
+bold "Test 3: Image with face (Lenna) — golden values"
+JSON=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" --lang fr "$DIR/lenna-face.png" 2>/dev/null)
 EXIT=$?
 assert "exit code 0" "[[ $EXIT -eq 0 ]]"
 FACES=$(echo "$JSON" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['faces']))")
-assert ">=1 face detected" "[[ $FACES -ge 1 ]]"
+assert "exactly 1 face detected" "[[ $FACES -eq 1 ]]"
+# Description
+DESC=$(echo "$JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('description',''))")
+assert "description = 'personne'" "[[ '$DESC' == 'personne' ]]"
+# Tags — Lenna should have people, adult, hat
+assert "tags include 'people'" "echo '$JSON' | python3 -c \"import sys,json; tags=[t['label'] for t in json.load(sys.stdin).get('tags',[])]; assert 'people' in tags, tags\""
+assert "tags include 'adult'" "echo '$JSON' | python3 -c \"import sys,json; tags=[t['label'] for t in json.load(sys.stdin).get('tags',[])]; assert 'adult' in tags, tags\""
+assert "tags include 'hat'" "echo '$JSON' | python3 -c \"import sys,json; tags=[t['label'] for t in json.load(sys.stdin).get('tags',[])]; assert 'hat' in tags, tags\""
+# Embedding
 EMBED_LEN=$(echo "$JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['faces'][0]['embedding']))")
-assert "embedding is 512d (adaface) or 768d (vision)" "[[ $EMBED_LEN -eq 512 || $EMBED_LEN -eq 768 ]]"
-CONF=$(echo "$JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{d[\"faces\"][0][\"confidence\"]:.1f}')")
-assert "confidence > 0.5" "python3 -c \"exit(0 if $CONF > 0.5 else 1)\""
-# Check model field present
-assert "model field present" "echo '$JSON' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d.get('model') in ('ir18','ir50'), d.get('model')\""
+assert "embedding is 512d (adaface)" "[[ $EMBED_LEN -eq 512 ]]"
+# Confidence
+assert "confidence = 1.0" "echo '$JSON' | python3 -c \"import sys,json; c=json.load(sys.stdin)['faces'][0]['confidence']; assert c >= 0.99, c\""
+# Quality
+assert "quality > 0.5" "echo '$JSON' | python3 -c \"import sys,json; q=json.load(sys.stdin)['faces'][0]['quality']; assert q > 0.5, q\""
+# Model field
+assert "model = ir18" "echo '$JSON' | python3 -c \"import sys,json; assert json.load(sys.stdin)['model'] == 'ir18'\""
+# L2 norm ~1.0
+assert "embedding L2-normalized" "echo '$JSON' | python3 -c \"import sys,json,math; e=json.load(sys.stdin)['faces'][0]['embedding']; n=math.sqrt(sum(x*x for x in e)); assert 0.99 < n < 1.01, n\""
 
 # ─── Test 4: --min-quality clamping ─────────────────────────────────
 bold "Test 4: --min-quality value clamping"
@@ -109,8 +123,49 @@ JSON_EN=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" --lang en "$DIR/lenna-face.png" 2>/d
 DESC_EN=$(echo "$JSON_EN" | python3 -c "import sys,json; print(json.load(sys.stdin).get('description',''))")
 assert "--lang en produces English description" "echo '$DESC_EN' | grep -qE 'person|baby|child|image'"
 
-# ─── Test 8: Watch mode — ping + image + shutdown ──────────────────
-bold "Test 8: Watch mode — ping + image + shutdown protocol"
+# ─── Test 8: IR-50 model (if installed) ────────────────────────────
+IR50_MODEL="/opt/homebrew/share/face-detect/AdaFace_IR50.mlpackage"
+if [[ -d "$IR50_MODEL" ]]; then
+    bold "Test 8: IR-50 model — detection + golden values"
+    JSON50=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" --model ir50 --lang fr "$DIR/lenna-face.png" 2>/dev/null)
+    assert "IR-50 exit code 0" "[[ $? -eq 0 ]]"
+    assert "IR-50 model field = ir50" "echo '$JSON50' | python3 -c \"import sys,json; assert json.load(sys.stdin)['model'] == 'ir50'\""
+    assert "IR-50 engine = adaface" "echo '$JSON50' | python3 -c \"import sys,json; assert json.load(sys.stdin)['engine'] == 'adaface'\""
+    assert "IR-50 dim = 512" "echo '$JSON50' | python3 -c \"import sys,json; assert json.load(sys.stdin)['engine_dim'] == 512\""
+    assert "IR-50 detects 1 face" "echo '$JSON50' | python3 -c \"import sys,json; assert len(json.load(sys.stdin)['faces']) == 1\""
+    assert "IR-50 description = personne" "echo '$JSON50' | python3 -c \"import sys,json; assert json.load(sys.stdin)['description'] == 'personne'\""
+    assert "IR-50 embedding 512d L2-normalized" "echo '$JSON50' | python3 -c \"
+import sys,json,math
+e=json.load(sys.stdin)['faces'][0]['embedding']
+assert len(e)==512, len(e)
+n=math.sqrt(sum(x*x for x in e))
+assert 0.99 < n < 1.01, n
+\""
+    # IR-50 embeddings must differ from IR-18 (proves model is actually loaded)
+    echo "$JSON" > /tmp/fd-test-ir18.json
+    echo "$JSON50" > /tmp/fd-test-ir50.json
+    assert "IR-50 embeddings differ from IR-18" "python3 -c \"
+import json, math
+ir18=json.load(open('/tmp/fd-test-ir18.json'))['faces'][0]['embedding']
+ir50=json.load(open('/tmp/fd-test-ir50.json'))['faces'][0]['embedding']
+dot=sum(a*b for a,b in zip(ir18,ir50))
+n18=math.sqrt(sum(x*x for x in ir18))
+n50=math.sqrt(sum(x*x for x in ir50))
+cos=dot/(n18*n50)
+assert cos < 0.95, f'IR18/IR50 cosine={cos:.4f}, too similar — same model?'
+\""
+    rm -f /tmp/fd-test-ir18.json /tmp/fd-test-ir50.json
+    # IR-50 with --lang en
+    DESC50_EN=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" --model ir50 --lang en "$DIR/lenna-face.png" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('description',''))")
+    assert "IR-50 --lang en description = person" "[[ '$DESC50_EN' == 'person' ]]"
+else
+    bold "Test 8: IR-50 model — SKIPPED (not installed)"
+    green "  SKIP: IR-50 model not found at $IR50_MODEL"
+fi
+
+# ─── Test 9: Watch mode — ping + image + shutdown ──────────────────
+bold "Test 9: Watch mode — ping + image + shutdown protocol"
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 mkfifo /tmp/fd-test-in /tmp/fd-test-out
 
@@ -154,7 +209,7 @@ DAEMON_PID=""
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 
 # ─── Test 9: SIGTERM clean exit ────────────────────────────────────
-bold "Test 9: SIGTERM clean exit"
+bold "Test 10: SIGTERM clean exit"
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 mkfifo /tmp/fd-test-in /tmp/fd-test-out
 
@@ -176,7 +231,7 @@ exec 4<&- 2>/dev/null
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 
 # ─── Test 10: No zombies ──────────────────────────────────────────
-bold "Test 10: Zero zombies"
+bold "Test 11: Zero zombies"
 set +o pipefail
 ZOMBIES=$(pgrep -x face-detect 2>/dev/null | wc -l | tr -d ' ')
 set -o pipefail
