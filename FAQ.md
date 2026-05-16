@@ -2,21 +2,53 @@
 
 ## Watch mode (FIFO daemon)
 
+### Format des embeddings (mitigation FIFO macOS 16 KB)
+
+Le buffer kernel d'une FIFO macOS commence à **16 KB** (`PIPE_SIZE`) et peut grandir dynamiquement à 64 KB mais redescend après drain. Une réponse `face-detect` avec 3-4 visages dépasse facilement 16 KB → le `write()` du daemon bloque, le client voit du JSON tronqué.
+
+face-detect v0.5.5+ propose deux mitigations :
+
+1. **Précision réduite (défaut)** : embeddings sérialisés à 6 chiffres significatifs au lieu du round-trip IEEE complet (~10 chiffres). Erreur cosine < 1e-6 → invisible pour la reconnaissance. Réduit la taille de ~10%.
+
+2. **Format base64** : flag `--embedding-format b64` → le champ `embedding` (array de 512 floats) devient `embedding_b64` (string base64 de 2732 chars). Réduit la taille de ~30%.
+
+Décodage Node :
+```js
+const buf = Buffer.from(face.embedding_b64, 'base64')
+const embedding = new Float32Array(buf.buffer, buf.byteOffset, 512)
+```
+
+⚠️ Même avec b64, une image avec 5+ visages peut encore saturer le buffer FIFO. Le fix définitif (transport Unix socket) arrive en 0.6.0.
+
+### Contrat client : 1 requête in-flight maximum
+
+**Règle stricte : envoyer une requête dans `in`, lire la réponse complète sur `out`, PUIS envoyer la suivante.**
+
+Le daemon est single-threaded par design. Plusieurs requêtes en parallèle dans la FIFO `in` ne sont **pas** "absorbées" plus vite — elles saturent le buffer kernel de sortie (64 KB) en quelques réponses, le `write()` du daemon bloque, et les réponses qui *arrivent* à passer s'entremêlent → JSON corrompu côté client.
+
+**Anti-patterns observés** :
+- ❌ Pool de N workers qui pushent en parallèle dans la même FIFO `in`
+- ❌ "Queue avec _maxInflight=4" qui injecte 4 requêtes avant d'attendre les réponses
+- ❌ Fire-and-forget ("j'enverrai la suivante quand j'y penserai")
+
+Si vous voulez du parallélisme côté API JS/Python, gardez la queue côté client mais sérialisez à **1 in-flight strict** au niveau de l'écriture FIFO.
+
 ### Mon client hang au bout de N images, mais face-detect ne crash pas
 
-**Cause la plus fréquente : le FIFO `out` n'est pas drainé assez vite côté client.**
+**Cause la plus fréquente : violation du contrat 1-in-flight ci-dessus, ou FIFO `out` pas drainé assez vite.**
 
-Le pipe de sortie a un buffer kernel de 64 KB. Chaque réponse avec visages fait ~20-30 KB en JSON (embeddings 512d). Si le client (Node, Python, etc.) ne lit pas la réponse avant d'envoyer la requête suivante, 2-3 réponses non lues saturent le buffer → le `write()` du daemon bloque → deadlock.
+Chaque réponse avec visages fait ~20-30 KB en JSON (embeddings 512d). 2-3 réponses non lues = buffer saturé = deadlock.
 
 **Diagnostic** :
 ```bash
 # Si le daemon a logué "processing" mais pas "done" → c'est bien le write qui bloque
 # Si "done" est logué mais le client ne reçoit rien → le read côté client est starved
+# Si "Expected ',' or ']' after array element" côté client → réponses entremêlées, plusieurs requêtes étaient in-flight
 ```
 
 **Solutions** :
 
-1. **Toujours lire la réponse AVANT d'envoyer la requête suivante** (mode synchrone)
+1. **`_maxInflight = 1` strict** au niveau de l'écriture FIFO (cf. section précédente)
 2. **Reader dédié haute priorité** — un stream reader séparé du event loop CPU-bound :
    ```javascript
    // Node.js — reader sur un fd séparé, pas bloqué par le processing
@@ -48,11 +80,13 @@ Utilisez le watch mode comme multiplexeur : un seul daemon sert tous les clients
 
 ## Neural Engine et Ollama
 
-### Face-detect affiche "ANE skipped (ollama running)"
+### Face-detect affiche "ANE skipped (Ollama MLX runner detected)"
 
-C'est normal et voulu. Ollama utilise MLX qui charge le Neural Engine. CoreML + MLX simultanés causent des deadlocks kernel irréversibles (processus en Uninterruptible state, survive même `kill -9`).
+Seul un runner **MLX** d'Ollama charge le Neural Engine. CoreML + MLX simultanés causent des deadlocks kernel irréversibles (processus en Uninterruptible state, survive même `kill -9`).
 
-face-detect v0.5.2+ détecte Ollama au démarrage et force CPU+GPU. La différence de performance est minime (quelques dizaines de ms/image).
+face-detect v0.5.4+ détecte spécifiquement les runners MLX (`pgrep -f 'ollama.runner.*mlx'`). Si seul `ollama serve` tourne, ou si le runner actif est `--ollama-engine` (llama.cpp + Metal GPU, ex: `nomic-embed-text`, modèles GGUF), l'ANE reste activé.
+
+**Avant v0.5.4** : tout processus Ollama déclenchait le skip, même un simple embedding model GPU. Comportement trop conservateur, corrigé.
 
 ### Face-detect est bloqué et ne répond plus à `kill -9`
 
@@ -62,15 +96,37 @@ ps aux | grep face-detect | awk '{print $8}'  # "U" = uninterruptible
 ```
 
 **Seul remède : reboot.** Pour éviter à l'avenir :
-- Ne jamais lancer face-detect + Ollama sans la protection ANE skip (v0.5.2+)
+- Ne jamais lancer face-detect + Ollama-MLX sans la protection ANE skip (v0.5.4+)
 - Ne jamais lancer 2+ processus face-detect simultanés
-- Variable de forçage : `FACE_DETECT_NO_ANE=1` (skip ANE même sans Ollama)
+- Variable de forçage : `FACE_DETECT_NO_ANE=1` (skip ANE inconditionnel)
 
-### Comment forcer CPU+GPU sans Ollama ?
+### Predict watchdog (mode watch, v0.5.4+)
+
+face-detect arme un watchdog par requête en mode `--watch`. Si un seul `processImage()` dépasse `--predict-timeout` secondes (60s par défaut), le daemon **exit 124** avec en stderr :
+
+```
+face-detect: predict watchdog fired (>predict-timeout, likely ANE/CoreML deadlock), exiting 124
+```
+
+C'est un signal pour le client : « j'étais coincé sur une image, je sors pour que tu puisses me relancer ». **Important** : ne **pas** retry la même image sur le daemon respawné — elle a sûrement déclenché le deadlock. Skip et passe à la suivante.
+
+Cas limites :
+- Si le predict est en **UE complète**, `_exit(124)` peut lui-même bloquer. Le client doit donc *aussi* avoir un heartbeat timeout (ping/pong) → respawn brutal. Le watchdog est une protection best-effort qui couvre les cas "lent mais pas mort".
+- À ajuster avec `--predict-timeout 30` si vos images sont petites et le throughput compte, ou `--predict-timeout 120` pour des batches photos lourdes.
+
+### Comment forcer CPU+GPU ?
 
 ```bash
-FACE_DETECT_NO_ANE=1 face-detect photo.jpg
+FACE_DETECT_NO_ANE=1 face-detect photo.jpg     # toujours skip ANE
 ```
+
+### Comment forcer l'ANE malgré la détection MLX ?
+
+```bash
+FACE_DETECT_FORCE_ANE=1 face-detect photo.jpg  # bypass la détection (à vos risques)
+```
+
+À n'utiliser que si vous savez que le runner MLX détecté ne touche pas l'ANE (cas rare). Risque de deadlock kernel sinon.
 
 ---
 

@@ -18,7 +18,7 @@ import CoreML
 import Foundation
 import Vision
 
-let VERSION = "0.5.3"
+let VERSION = "0.6.0"
 
 // MARK: - Utilities
 
@@ -66,6 +66,22 @@ struct TagResult: Encodable {
     let confidence: Float
 }
 
+// Output format for the embedding vector. `.float` (default, back-compat) emits a
+// JSON array of numbers rounded to 6 significant figures (≈30% smaller than the
+// IEEE round-trip representation, error <1e-6 → negligible for cosine similarity).
+// `.b64` emits a single base64 string of little-endian Float32 bytes (≈70% smaller
+// vs default), under field `embedding_b64`. Mitigates macOS FIFO ~16 KB saturation
+// on multi-face responses. v0.5.5+.
+enum EmbeddingFormat: String { case float, b64 }
+var embeddingFormat: EmbeddingFormat = .float
+
+func roundSig(_ x: Float, sig: Int) -> Float {
+    guard x.isFinite, x != 0 else { return x }
+    let d = Double(abs(x))
+    let mag = pow(10.0, Double(sig - 1) - floor(log10(d)))
+    return Float((Double(x) * mag).rounded() / mag)
+}
+
 struct FaceResult: Encodable {
     let bbox: [Double]          // [x, y, w, h] normalized 0-1, origin bottom-left
     let confidence: Float
@@ -75,6 +91,31 @@ struct FaceResult: Encodable {
     let pitch: Double?
     let embedding: [Float]      // 512 floats (AdaFace) or 768 (Vision)
     let landmarks: [String: [[Double]]]?
+
+    enum CodingKeys: String, CodingKey {
+        case bbox, confidence, quality, roll, yaw, pitch
+        case embedding, embedding_b64
+        case landmarks
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(bbox, forKey: .bbox)
+        try c.encode(confidence, forKey: .confidence)
+        try c.encodeIfPresent(quality, forKey: .quality)
+        try c.encodeIfPresent(roll, forKey: .roll)
+        try c.encodeIfPresent(yaw, forKey: .yaw)
+        try c.encodeIfPresent(pitch, forKey: .pitch)
+        switch embeddingFormat {
+        case .float:
+            let compact = embedding.map { roundSig($0, sig: 6) }
+            try c.encode(compact, forKey: .embedding)
+        case .b64:
+            let bytes = embedding.withUnsafeBufferPointer { Data(buffer: $0) }
+            try c.encode(bytes.base64EncodedString(), forKey: .embedding_b64)
+        }
+        try c.encodeIfPresent(landmarks, forKey: .landmarks)
+    }
 }
 
 struct BenchResult: Encodable {
@@ -213,6 +254,8 @@ var descLang: DescriptionLang = .fr
 var minQuality: Float = 0.0
 var globalTimeoutSec: Int = 30
 var idleTimeoutSec: UInt32 = 1800  // 30 min default for watch mode
+var predictTimeoutSec: UInt32 = 60 // per-image watchdog (watch mode); exits if a single predict blocks > N sec
+var watchdogInPredict: Int32 = 0   // sig_atomic_t: 1 inside processImage(), 0 otherwise. Reads in signal handler must be lock-free.
 
 func modelLabel() -> String? {
     activeEngine == .adaface ? adaFaceVariant.rawValue : nil
@@ -244,14 +287,23 @@ func loadAdaFaceModel() {
         return
     }
 
-    // Detect ANE contention: if Ollama/MLX is running, force CPU+GPU to avoid kernel deadlock.
-    // The Neural Engine is a shared resource with no kernel-level timeout — concurrent access
-    // from CoreML + Ollama MLX causes UE (uninterruptible) state that survives SIGKILL.
+    // Detect ANE contention: only MLX runners actually hold the Neural Engine.
+    // "ollama serve" alone, or with Metal/GGUF runners (--ollama-engine), uses GPU
+    // not ANE — no conflict with CoreML. Pre-0.5.4 we skipped ANE for any Ollama
+    // process, which was overly conservative (penalized nomic-embed-text, GGUF LLMs).
+    // Overrides:
+    //   FACE_DETECT_NO_ANE=1    → always skip ANE (paranoia / known-good fallback)
+    //   FACE_DETECT_FORCE_ANE=1 → always use ANE, bypass MLX detection
+    let env = ProcessInfo.processInfo.environment
+    let forceSkip = env["FACE_DETECT_NO_ANE"] == "1"
+    let forceANE = env["FACE_DETECT_FORCE_ANE"] == "1"
+    let mlxRunner = !forceANE && (shell("pgrep -f 'ollama.runner.*mlx'") == 0)
+
     let config = MLModelConfiguration()
-    let ollamaRunning = (shell("pgrep -x ollama") == 0)
-    if ollamaRunning || ProcessInfo.processInfo.environment["FACE_DETECT_NO_ANE"] == "1" {
+    if forceSkip || mlxRunner {
         config.computeUnits = .cpuAndGPU
-        FileHandle.standardError.write(Data("face-detect: ANE skipped (\(ollamaRunning ? "ollama running" : "FACE_DETECT_NO_ANE")), using CPU+GPU\n".utf8))
+        let reason = forceSkip ? "FACE_DETECT_NO_ANE" : "Ollama MLX runner detected"
+        FileHandle.standardError.write(Data("face-detect: ANE skipped (\(reason)), using CPU+GPU\n".utf8))
     } else {
         config.computeUnits = .all  // Neural Engine when available
     }
@@ -630,13 +682,13 @@ func cmdBatch() {
     }
 }
 
-// MARK: - Mode: watch (FIFO daemon)
+// MARK: - Mode: watch (FIFO or Unix socket daemon)
 
-func cmdWatch(inPath: String, outPath: String) {
+// Shared signal-handler installer for watch modes. Idle/predict alarm semantics
+// are identical between transports.
+func installWatchSignalHandlers() {
     signal(SIGPIPE, SIG_IGN)
 
-    // Graceful shutdown via POSIX signal handlers (not GCD — fires while blocked in read).
-    // Uses StaticString + write(2) + _exit(2) only — fully async-signal-safe.
     signal(SIGTERM) { _ in
         let msg: StaticString = "face-detect: SIGTERM, exiting\n"
         _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
@@ -648,27 +700,42 @@ func cmdWatch(inPath: String, outPath: String) {
         _exit(0)
     }
 
-    // Idle timeout via POSIX alarm() — kernel-level, fires even if blocked in read().
-    // Rearms after each message. Default 30 min, configurable via --idle-timeout.
+    // POSIX alarm() serves two roles, distinguished by the watchdogInPredict flag:
+    //   - watchdogInPredict == 0 → idle timeout (no input for N sec). Default 30 min.
+    //   - watchdogInPredict == 1 → predict watchdog (one image stuck > N sec, likely
+    //     ANE deadlock or CoreML zombification). Exit 124 to signal "respawn me" to
+    //     the client. Default 60s, configurable via --predict-timeout.
     signal(SIGALRM) { _ in
-        let msg: StaticString = "face-detect: idle timeout, exiting\n"
-        _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
-        _exit(0)
+        if watchdogInPredict != 0 {
+            let msg: StaticString = "face-detect: predict watchdog fired (>predict-timeout, likely ANE/CoreML deadlock), exiting 124\n"
+            _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
+            _exit(124)
+        } else {
+            let msg: StaticString = "face-detect: idle timeout, exiting\n"
+            _ = write(STDERR_FILENO, msg.utf8Start, msg.utf8CodeUnitCount)
+            _exit(0)
+        }
     }
-    alarm(idleTimeoutSec)
+}
 
-    let startTime = DispatchTime.now()
-    var processed = 0
-    let decoder = JSONDecoder()
-
+// Per-session loop: reads newline-delimited JSON commands from inHandle, writes
+// responses to outHandle (which may be the same fd for socket streams). Returns
+// when the peer disconnects (EOF). Updates `processed` and rearms alarms.
+// `clientLabel` is used only for stderr logs.
+func runWatchSession(
+    inHandle: FileHandle,
+    outHandle: FileHandle,
+    decoder: JSONDecoder,
+    startTime: DispatchTime,
+    processed: inout Int,
+    clientLabel: String
+) {
     func uptimeMs() -> Int {
         Int((DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000)
     }
-
     func logStderr(_ msg: String) {
         FileHandle.standardError.write(Data("face-detect: \(msg)\n".utf8))
     }
-
     func emitJSON<T: Encodable>(_ value: T, to handle: FileHandle) {
         let enc = JSONEncoder()
         enc.outputFormatting = [.sortedKeys]
@@ -677,10 +744,120 @@ func cmdWatch(inPath: String, outPath: String) {
         handle.write(Data([0x0a]))
     }
 
-    logStderr("ready (engine=\(activeEngine.rawValue), model=\(adaFaceVariant.rawValue), dim=\(engineDim()), idle_timeout=\(idleTimeoutSec)s, in=\(inPath), out=\(outPath))")
+    var buffer = Data()
+    while true {
+        let chunk = inHandle.availableData
+        if chunk.isEmpty { break } // EOF — peer disconnected
+        buffer.append(chunk)
+
+        if buffer.count > 65536 {
+            logStderr("input buffer overflow (>64KiB without newline), dropping (\(clientLabel))")
+            buffer.removeAll(keepingCapacity: true)
+            continue
+        }
+
+        while let nlRange = buffer.range(of: Data([0x0a])) {
+            let lineData = buffer[buffer.startIndex..<nlRange.lowerBound]
+            buffer.removeSubrange(buffer.startIndex...nlRange.lowerBound)
+
+            guard let line = String(data: lineData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !line.isEmpty else { continue }
+
+            alarm(idleTimeoutSec)
+
+            autoreleasepool {
+                var requestId: String? = nil
+                var imagePath: String? = nil
+                var isPing = false
+                var isShutdown = false
+
+                if line.hasPrefix("{") {
+                    if let data = line.data(using: .utf8),
+                       let req = try? decoder.decode(WatchRequest.self, from: data) {
+                        requestId = req.id
+                        imagePath = req.image
+                        isPing = req.ping ?? false
+                        isShutdown = req.shutdown ?? false
+                    } else {
+                        logStderr("malformed JSON (parse failed): \(line.prefix(120))")
+                        return
+                    }
+                } else {
+                    imagePath = line
+                }
+
+                if isShutdown {
+                    logStderr("shutdown requested (processed=\(processed))")
+                    emitJSON(ShutdownResponse(
+                        shutdown: true,
+                        id: requestId,
+                        uptime_ms: uptimeMs(),
+                        processed: processed
+                    ), to: outHandle)
+                    outHandle.synchronizeFile()
+                    outHandle.closeFile()
+                    _exit(0)
+                }
+
+                if isPing {
+                    emitJSON(PongResponse(
+                        pong: true,
+                        id: requestId,
+                        uptime_ms: uptimeMs(),
+                        processed: processed,
+                        engine: activeEngine.rawValue,
+                        engine_dim: engineDim(),
+                        model: modelLabel()
+                    ), to: outHandle)
+                    return
+                }
+
+                guard let path = imagePath else {
+                    logStderr("malformed request (no image): \(line.prefix(120))")
+                    return
+                }
+
+                let result: ImageResult
+                let t0 = DispatchTime.now()
+                if let (cg, _, _) = loadCGImage(path: path) {
+                    logStderr("processing \(path)")
+                    watchdogInPredict = 1
+                    alarm(predictTimeoutSec)
+                    result = processImage(path: path, cgImage: cg)
+                    watchdogInPredict = 0
+                    alarm(idleTimeoutSec)
+                } else {
+                    result = ImageResult(
+                        image: path, width: 0, height: 0, elapsed_ms: 0,
+                        engine: activeEngine.rawValue, engine_dim: engineDim(),
+                        model: modelLabel(),
+                        description: nil, tags: nil, faces: nil, error: "cannot load image"
+                    )
+                }
+                processed += 1
+                let took = Int((DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000)
+                let faceCount = result.faces?.count ?? 0
+                let errPart = result.error.map { " error=\($0)" } ?? ""
+                logStderr("done \(path) in \(took)ms (\(faceCount) faces)\(errPart)")
+
+                emitJSON(IdentifiedImageResult(id: requestId, result: result), to: outHandle)
+            }
+        }
+    }
+}
+
+func cmdWatch(inPath: String, outPath: String) {
+    installWatchSignalHandlers()
+    alarm(idleTimeoutSec)
+
+    let startTime = DispatchTime.now()
+    var processed = 0
+    let decoder = JSONDecoder()
+
+    FileHandle.standardError.write(Data("face-detect: ready (engine=\(activeEngine.rawValue), model=\(adaFaceVariant.rawValue), dim=\(engineDim()), idle_timeout=\(idleTimeoutSec)s, predict_timeout=\(predictTimeoutSec)s, embedding_format=\(embeddingFormat.rawValue), transport=fifo, in=\(inPath), out=\(outPath))\n".utf8))
 
     while true {
-        // Opens block until writer/reader connect
         guard let inHandle = FileHandle(forReadingAtPath: inPath) else {
             die("cannot open input FIFO: \(inPath)")
         }
@@ -688,113 +865,99 @@ func cmdWatch(inPath: String, outPath: String) {
             die("cannot open output FIFO: \(outPath)")
         }
 
-        var buffer = Data()
-        while true {
-            let chunk = inHandle.availableData
-            if chunk.isEmpty { break } // EOF — writer disconnected
-            buffer.append(chunk)
-
-            // Cap buffer growth at 64 KiB (paths > PATH_MAX are pathological)
-            if buffer.count > 65536 {
-                logStderr("input buffer overflow (>64KiB without newline), dropping")
-                buffer.removeAll(keepingCapacity: true)
-                continue
-            }
-
-            while let nlRange = buffer.range(of: Data([0x0a])) {
-                let lineData = buffer[buffer.startIndex..<nlRange.lowerBound]
-                buffer.removeSubrange(buffer.startIndex...nlRange.lowerBound)
-
-                guard let line = String(data: lineData, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines),
-                      !line.isEmpty else { continue }
-
-                // Rearm idle timeout on any input
-                alarm(idleTimeoutSec)
-
-                autoreleasepool {
-                    // Parse: JSON command, or plain path (back-compat)
-                    var requestId: String? = nil
-                    var imagePath: String? = nil
-                    var isPing = false
-                    var isShutdown = false
-
-                    if line.hasPrefix("{") {
-                        if let data = line.data(using: .utf8),
-                           let req = try? decoder.decode(WatchRequest.self, from: data) {
-                            requestId = req.id
-                            imagePath = req.image
-                            isPing = req.ping ?? false
-                            isShutdown = req.shutdown ?? false
-                        } else {
-                            logStderr("malformed JSON (parse failed): \(line.prefix(120))")
-                            return
-                        }
-                    } else {
-                        imagePath = line
-                    }
-
-                    // Handle shutdown
-                    if isShutdown {
-                        logStderr("shutdown requested (processed=\(processed))")
-                        emitJSON(ShutdownResponse(
-                            shutdown: true,
-                            id: requestId,
-                            uptime_ms: uptimeMs(),
-                            processed: processed
-                        ), to: outHandle)
-                        outHandle.synchronizeFile()
-                        outHandle.closeFile()
-                        _exit(0)
-                    }
-
-                    // Handle ping
-                    if isPing {
-                        emitJSON(PongResponse(
-                            pong: true,
-                            id: requestId,
-                            uptime_ms: uptimeMs(),
-                            processed: processed,
-                            engine: activeEngine.rawValue,
-                            engine_dim: engineDim(),
-                            model: modelLabel()
-                        ), to: outHandle)
-                        return
-                    }
-
-                    guard let path = imagePath else {
-                        logStderr("malformed request (no image): \(line.prefix(120))")
-                        return
-                    }
-
-                    let result: ImageResult
-                    let t0 = DispatchTime.now()
-                    if let (cg, _, _) = loadCGImage(path: path) {
-                        logStderr("processing \(path)")
-                        result = processImage(path: path, cgImage: cg)
-                    } else {
-                        result = ImageResult(
-                            image: path, width: 0, height: 0, elapsed_ms: 0,
-                            engine: activeEngine.rawValue, engine_dim: engineDim(),
-                            model: modelLabel(),
-                            description: nil, tags: nil, faces: nil, error: "cannot load image"
-                        )
-                    }
-                    processed += 1
-                    let took = Int((DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000)
-                    let faceCount = result.faces?.count ?? 0
-                    let errPart = result.error.map { " error=\($0)" } ?? ""
-                    logStderr("done \(path) in \(took)ms (\(faceCount) faces)\(errPart)")
-
-                    emitJSON(IdentifiedImageResult(id: requestId, result: result), to: outHandle)
-                }
-            }
-        }
+        runWatchSession(
+            inHandle: inHandle,
+            outHandle: outHandle,
+            decoder: decoder,
+            startTime: startTime,
+            processed: &processed,
+            clientLabel: "fifo"
+        )
 
         inHandle.closeFile()
         outHandle.closeFile()
-        logStderr("writer disconnected (processed=\(processed)), waiting for reconnect")
-        // Rearm idle timeout after disconnect too
+        FileHandle.standardError.write(Data("face-detect: writer disconnected (processed=\(processed)), waiting for reconnect\n".utf8))
+        alarm(idleTimeoutSec)
+    }
+}
+
+// Unix domain socket transport. Buffer = 1 MB (SO_SNDBUF/SO_RCVBUF) — eliminates
+// the ~16 KB macOS FIFO PIPE_SIZE stall on multi-face responses. One client at a
+// time (listen backlog 1) to preserve single-threaded CoreML semantics.
+func cmdWatchSocket(socketPath: String) {
+    installWatchSignalHandlers()
+    alarm(idleTimeoutSec)
+
+    // Remove stale socket file from previous run (e.g. crash, no graceful unlink).
+    // unlink() returning ENOENT is harmless.
+    _ = unlink(socketPath)
+
+    let serverFd = socket(AF_UNIX, SOCK_STREAM, 0)
+    if serverFd < 0 { die("socket() failed: \(String(cString: strerror(errno)))") }
+
+    // Set buffers BEFORE bind/listen so any accepted child fd inherits them.
+    var bufSize: Int32 = 1024 * 1024
+    _ = setsockopt(serverFd, SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+    _ = setsockopt(serverFd, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathLen = socketPath.utf8.count
+    // sun_path is 104 bytes on Darwin; -1 for the NUL terminator.
+    if pathLen >= 104 {
+        die("socket path too long (\(pathLen) >= 104 bytes): \(socketPath)")
+    }
+    withUnsafeMutablePointer(to: &addr.sun_path.0) { dst in
+        socketPath.utf8CString.withUnsafeBufferPointer { src in
+            _ = memcpy(dst, src.baseAddress, src.count)
+        }
+    }
+    let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+    let bindOK = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+            bind(serverFd, sa, addrLen)
+        }
+    }
+    if bindOK != 0 { die("bind(\(socketPath)) failed: \(String(cString: strerror(errno)))") }
+    if listen(serverFd, 1) != 0 { die("listen() failed: \(String(cString: strerror(errno)))") }
+
+    // chmod 0600 — only owner may connect. (umask may have stripped bits.)
+    _ = chmod(socketPath, 0o600)
+
+    FileHandle.standardError.write(Data("face-detect: ready (engine=\(activeEngine.rawValue), model=\(adaFaceVariant.rawValue), dim=\(engineDim()), idle_timeout=\(idleTimeoutSec)s, predict_timeout=\(predictTimeoutSec)s, embedding_format=\(embeddingFormat.rawValue), transport=unix-socket, socket=\(socketPath), sndbuf=\(bufSize))\n".utf8))
+
+    let startTime = DispatchTime.now()
+    var processed = 0
+    let decoder = JSONDecoder()
+
+    while true {
+        let clientFd = accept(serverFd, nil, nil)
+        if clientFd < 0 {
+            // EINTR from SIGALRM is benign — alarm handler will _exit if it fires
+            // for real timeout reasons. Just retry.
+            if errno == EINTR { continue }
+            FileHandle.standardError.write(Data("face-detect: accept() failed: \(String(cString: strerror(errno)))\n".utf8))
+            continue
+        }
+        // Reinforce buffer sizes on accepted fd (Darwin doesn't always inherit).
+        _ = setsockopt(clientFd, SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(clientFd, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+
+        // One FileHandle for the duplex socket fd. closeOnDealloc=false so we
+        // control the lifecycle and can close() exactly once below.
+        let handle = FileHandle(fileDescriptor: clientFd, closeOnDealloc: false)
+
+        runWatchSession(
+            inHandle: handle,
+            outHandle: handle,
+            decoder: decoder,
+            startTime: startTime,
+            processed: &processed,
+            clientLabel: "socket"
+        )
+
+        close(clientFd)
+        FileHandle.standardError.write(Data("face-detect: client disconnected (processed=\(processed)), waiting for reconnect\n".utf8))
         alarm(idleTimeoutSec)
     }
 }
@@ -949,6 +1112,22 @@ func extractGlobalFlags(_ args: [String]) -> [String] {
             }
             idleTimeoutSec = UInt32(clamped)
             i += 2
+        } else if a == "--embedding-format", i + 1 < args.count {
+            if let f = EmbeddingFormat(rawValue: args[i + 1].lowercased()) {
+                embeddingFormat = f
+            } else {
+                FileHandle.standardError.write(Data("face-detect: invalid --embedding-format '\(args[i + 1])', expected 'float' or 'b64'\n".utf8))
+                exit(2)
+            }
+            i += 2
+        } else if a == "--predict-timeout", i + 1 < args.count {
+            let raw = Int(args[i + 1]) ?? 60
+            let clamped = max(5, raw)
+            if clamped != raw {
+                FileHandle.standardError.write(Data("face-detect: --predict-timeout clamped from \(raw) to \(clamped)s (minimum 5)\n".utf8))
+            }
+            predictTimeoutSec = UInt32(clamped)
+            i += 2
         } else {
             rest.append(a)
             i += 1
@@ -966,7 +1145,8 @@ face-detect \(VERSION) — face detection + recognition embeddings via Apple Vis
 USAGE
   face-detect [FLAGS] <image>                              Single image → JSON
   face-detect [FLAGS] --batch                              stdin → NDJSON
-  face-detect [FLAGS] --watch --in <fifo> --out <fifo>     FIFO daemon
+  face-detect [FLAGS] --watch --socket <path>              Unix socket daemon (recommended, v0.6.0+)
+  face-detect [FLAGS] --watch --in <fifo> --out <fifo>     FIFO daemon (back-compat)
   face-detect [FLAGS] --video <file> [--fps <rate>]        Video frames → NDJSON
   face-detect [FLAGS] --bench <folder>                     Throughput benchmark
 
@@ -977,17 +1157,33 @@ GLOBAL FLAGS
   --min-quality 0.0-1.0      Skip faces below threshold (default: 0)
   --timeout <seconds>        SIGALRM kill after N seconds (default: 30, CLI modes)
   --idle-timeout <seconds>   Auto-exit if no request (default: 1800, --watch only, min 60)
+  --predict-timeout <sec>    Exit 124 if a single image processing exceeds N sec (default: 60, --watch only, min 5)
+                             Signals UE/ANE deadlock to the client → respawn the daemon.
+  --embedding-format <fmt>   Embedding JSON format: 'float' (default, array of numbers, 6 sig figs)
+                             or 'b64' (base64 Float32 little-endian under "embedding_b64").
+                             Use 'b64' to halve response size and avoid macOS FIFO saturation
+                             on multi-face images (>16 KB ≈ 4+ faces triggers kernel pipe stall).
 
 SAFETY
   CLI modes (single, batch, video, bench) are DISABLED by default to prevent
   zombie processes from Neural Engine deadlocks. Set FACE_DETECT_ALLOW_CLI=1.
   Even with override, alarm() kills the process after --timeout seconds.
 
-WATCH PROTOCOL
-  Input (FIFO):  {"image":"/path"} or {"ping":true} or {"shutdown":true}
-                 Optional "id" field propagated as "id" in response.
-  Output (FIFO): ImageResult JSON, PongResponse, or ShutdownResponse.
-  Idle timeout:  Process exits after --idle-timeout seconds without activity.
+WATCH PROTOCOL (transport-agnostic — same JSON over FIFO or Unix socket)
+  Request:  {"image":"/path"} or {"ping":true} or {"shutdown":true}
+            Optional "id" field propagated as "id" in response.
+  Response: ImageResult JSON, PongResponse, or ShutdownResponse, newline-terminated.
+  Idle timeout:    Process exits 0 after --idle-timeout seconds without activity.
+  Predict watchdog: Process exits 124 if a single image exceeds --predict-timeout.
+                    Indicates ANE/CoreML deadlock — client should respawn the daemon.
+
+WATCH TRANSPORTS
+  --socket <path>  Unix domain socket (recommended). 1 MB SO_SNDBUF/SO_RCVBUF,
+                   eliminates macOS FIFO 16 KB stall on multi-face responses.
+                   One client at a time (listen backlog 1). chmod 0600 set on socket.
+                   Connect from Node: net.createConnection({ path: '/tmp/face.sock' })
+  --in/--out       Named FIFOs (legacy). Kept for back-compat with existing clients.
+                   Subject to macOS PIPE_SIZE saturation — see FAQ.md.
 
 SUPPORTED FORMATS
   HEIC, JPEG, PNG, TIFF
@@ -1039,19 +1235,27 @@ case "--batch":
 case "--watch":
     var inPath: String?
     var outPath: String?
+    var socketPath: String?
     var i = 1
     while i < args.count {
         switch args[i] {
-        case "--in":  i += 1; if i < args.count { inPath = args[i] }
-        case "--out": i += 1; if i < args.count { outPath = args[i] }
+        case "--in":     i += 1; if i < args.count { inPath = args[i] }
+        case "--out":    i += 1; if i < args.count { outPath = args[i] }
+        case "--socket": i += 1; if i < args.count { socketPath = args[i] }
         default: break
         }
         i += 1
     }
-    guard let inp = inPath, let outp = outPath else {
-        die("usage: face-detect --watch --in <fifo> --out <fifo>")
+    if let sock = socketPath {
+        if inPath != nil || outPath != nil {
+            die("usage: --socket is mutually exclusive with --in/--out")
+        }
+        cmdWatchSocket(socketPath: sock)
+    } else if let inp = inPath, let outp = outPath {
+        cmdWatch(inPath: inp, outPath: outp)
+    } else {
+        die("usage: face-detect --watch (--socket <path> | --in <fifo> --out <fifo>)")
     }
-    cmdWatch(inPath: inp, outPath: outp)
 
 case "--video":
     guard args.count >= 2 else {

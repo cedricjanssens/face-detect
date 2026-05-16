@@ -233,8 +233,139 @@ exec 3>&- 2>/dev/null
 exec 4<&- 2>/dev/null
 rm -f /tmp/fd-test-in /tmp/fd-test-out
 
-# ─── Test 10: No zombies ──────────────────────────────────────────
-bold "Test 11: Zero zombies"
+# ─── Test 11: Predict watchdog flag plumbing ──────────────────────
+bold "Test 11: --predict-timeout flag plumbing"
+rm -f /tmp/fd-test-in /tmp/fd-test-out
+mkfifo /tmp/fd-test-in /tmp/fd-test-out
+
+"$BINARY" --idle-timeout 60 --predict-timeout 30 --watch --in /tmp/fd-test-in --out /tmp/fd-test-out 2>/tmp/fd-test-stderr &
+DAEMON_PID=$!
+sleep 2
+
+exec 3>/tmp/fd-test-in
+exec 4</tmp/fd-test-out
+
+assert "ready log mentions predict_timeout=30s" "grep -q 'predict_timeout=30s' /tmp/fd-test-stderr"
+
+# Process an image — should succeed (predict << 30s)
+echo "{\"image\":\"$DIR/lenna-face.png\",\"id\":\"watchdog-ok\"}" >&3
+read -t 15 RESP <&4
+assert "predict completes well under watchdog" "echo '$RESP' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d.get('id')=='watchdog-ok' and len(d.get('faces',[]))>=1\""
+
+echo '{"shutdown":true,"id":"bye"}' >&3
+read -t 10 RESP <&4
+exec 3>&-
+exec 4<&-
+sleep 1
+DAEMON_PID=""
+rm -f /tmp/fd-test-in /tmp/fd-test-out /tmp/fd-test-stderr
+
+# Clamping check (predict-timeout < 5 should clamp to 5)
+CLAMP_OUT=$("$BINARY" --predict-timeout 1 --watch --in /tmp/no-such --out /tmp/no-such 2>&1 &
+sleep 0.3; kill $! 2>/dev/null; true)
+assert "predict-timeout=1 clamped to 5" "echo \"$CLAMP_OUT\" | grep -q 'clamped from 1 to 5'"
+
+# ─── Test 12: Embedding format options ────────────────────────────
+bold "Test 12: --embedding-format float (default) and b64"
+
+# Default float — must have "embedding" array of 512 floats
+OUT=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" "$DIR/lenna-face.png" 2>/dev/null)
+assert "default format has embedding array of 512 floats" "echo '$OUT' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert isinstance(d['faces'][0]['embedding'], list) and len(d['faces'][0]['embedding'])==512\""
+assert "default format has NO embedding_b64 field" "echo '$OUT' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert 'embedding_b64' not in d['faces'][0]\""
+# 6-sig-figs roundtrip: re-rounding the JSON value should be idempotent (≤1e-7 diff).
+assert "default values pre-rounded to 6 sig figs" "echo '$OUT' | python3 -c \"
+import sys, json, math
+d = json.load(sys.stdin)
+emb = d['faces'][0]['embedding']
+def sig6(x):
+    if x == 0: return 0.0
+    mag = 10 ** (5 - math.floor(math.log10(abs(x))))
+    return round(x * mag) / mag
+mismatches = [v for v in emb if abs(v - sig6(v)) > 1e-7]
+assert len(mismatches) == 0, f'{len(mismatches)}/512 not at 6 sig figs, first: {mismatches[:3]}'
+\""
+
+# b64 mode — must have "embedding_b64" string instead of "embedding"
+OUT_B64=$(FACE_DETECT_ALLOW_CLI=1 "$BINARY" --embedding-format b64 "$DIR/lenna-face.png" 2>/dev/null)
+assert "b64 format has embedding_b64 string" "echo '$OUT_B64' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert isinstance(d['faces'][0]['embedding_b64'], str) and len(d['faces'][0]['embedding_b64'])>2000\""
+assert "b64 format has NO embedding array field" "echo '$OUT_B64' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert 'embedding' not in d['faces'][0]\""
+assert "b64 decodes to 512 little-endian Float32, L2-normalized" "echo '$OUT_B64' | python3 -c \"
+import sys, json, base64, struct, math
+d = json.load(sys.stdin)
+b = base64.b64decode(d['faces'][0]['embedding_b64'])
+assert len(b) == 2048, f'expected 2048 bytes, got {len(b)}'
+floats = struct.unpack('<512f', b)
+norm = math.sqrt(sum(x*x for x in floats))
+assert 0.99 < norm < 1.01, f'L2 norm should be ~1, got {norm}'
+\""
+
+# b64 response is meaningfully smaller than float (≈25-30% smaller for 1 face)
+B64_LEN=${#OUT_B64}
+FLOAT_LEN=${#OUT}
+assert "b64 response smaller than float response" "[[ $B64_LEN -lt $FLOAT_LEN ]]"
+
+# Invalid format → exit 2
+set +e
+FACE_DETECT_ALLOW_CLI=1 "$BINARY" --embedding-format nonsense "$DIR/lenna-face.png" >/dev/null 2>&1
+INVALID_EXIT=$?
+set -e
+assert "invalid --embedding-format rejected (exit 2)" "[[ $INVALID_EXIT -eq 2 ]]"
+
+# ─── Test 13: Unix socket transport ────────────────────────────────
+bold "Test 13: Watch mode — Unix domain socket"
+SOCK=/tmp/fd-test.sock
+rm -f "$SOCK"
+
+"$BINARY" --idle-timeout 60 --watch --socket "$SOCK" 2>/tmp/fd-test-stderr &
+DAEMON_PID=$!
+sleep 2
+
+assert "socket daemon starts" "kill -0 $DAEMON_PID 2>/dev/null"
+assert "socket file created" "[[ -S '$SOCK' ]]"
+assert "socket has 0600 permissions" "ls -l '$SOCK' | grep -q '^srw-------'"
+assert "ready log mentions transport=unix-socket" "grep -q 'transport=unix-socket' /tmp/fd-test-stderr"
+assert "ready log mentions sndbuf=1048576" "grep -q 'sndbuf=1048576' /tmp/fd-test-stderr"
+
+# Run ping + image + shutdown in one session via python (proper duplex socket I/O)
+RESPONSES=$(python3 -c "
+import socket, json, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect('$SOCK')
+f = s.makefile('rwb', buffering=0)
+out = []
+for req in [
+    {'ping': True, 'id': 'sock-ping'},
+    {'image': '$DIR/lenna-face.png', 'id': 'sock-img'},
+    {'shutdown': True, 'id': 'sock-bye'},
+]:
+    f.write((json.dumps(req) + '\n').encode())
+    line = f.readline()
+    out.append(line.decode().strip())
+print('\n'.join(out))
+")
+
+PONG=$(echo "$RESPONSES" | sed -n 1p)
+IMG=$(echo "$RESPONSES" | sed -n 2p)
+SHUT=$(echo "$RESPONSES" | sed -n 3p)
+
+assert "socket ping returns pong+id" "echo '$PONG' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['pong']==True and d['id']=='sock-ping'\""
+assert "socket image returns 1 face+id" "echo '$IMG' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert len(d['faces'])==1 and d['id']=='sock-img'\""
+assert "socket shutdown returns ack" "echo '$SHUT' | python3 -c \"import sys,json; d=json.load(sys.stdin); assert d['shutdown']==True and d['id']=='sock-bye'\""
+
+wait $DAEMON_PID 2>/dev/null
+assert "daemon exited after socket shutdown" "! kill -0 $DAEMON_PID 2>/dev/null"
+DAEMON_PID=""
+rm -f "$SOCK" /tmp/fd-test-stderr
+
+# Mutually exclusive: --socket cannot combine with --in/--out
+set +e
+"$BINARY" --watch --socket /tmp/x --in /tmp/y --out /tmp/z 2>/dev/null
+MIX_EXIT=$?
+set -e
+assert "--socket + --in mutually exclusive" "[[ $MIX_EXIT -ne 0 ]]"
+
+# ─── Test 14: No zombies ──────────────────────────────────────────
+bold "Test 14: Zero zombies"
 set +o pipefail
 # Count only NEW face-detect processes (exclude pre-existing ones like archiviste daemon)
 CURRENT_PIDS=$(pgrep -x face-detect 2>/dev/null || true)
